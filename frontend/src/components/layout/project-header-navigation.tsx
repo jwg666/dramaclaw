@@ -32,6 +32,7 @@ const XIAJI_DEFAULT_ROUTE = PROJECT_SECTION_ROUTES.ingest;
 
 const xiajiMenuItems = [
   { labelKey: "nav.ingest", to: PROJECT_SECTION_ROUTES.ingest },
+  { labelKey: "nav.screenplays", to: PROJECT_SECTION_ROUTES.screenplays },
   { labelKey: "nav.assets", to: PROJECT_SECTION_ROUTES.characters },
   {
     labelKey: "nav.episodes",

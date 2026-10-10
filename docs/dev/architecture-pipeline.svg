@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 620" font-family="Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif">
+  <defs>
+    <marker id="arw2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9aa7b4"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1240" height="620" fill="#ffffff"/>
+  <text x="40" y="40" font-size="22" font-weight="bold" fill="#111827">创作流水线 · 小说 → 成片</text>
+  <text x="40" y="62" font-size="13" fill="#64748b">structured_v1 主路径 · 每步为可跳步/可续跑的后台任务(任务中心 SSE 进度) · 括号为关键实现</text>
+
+  <!-- 第一行 1→5 -->
+  <rect x="40" y="92" width="215" height="100" rx="10" fill="#eef5ff" stroke="#5b8dd9"/>
+  <text x="54" y="118" font-size="13.5" font-weight="bold" fill="#1f2937">① 导入小说</text>
+  <text x="54" y="140" font-size="10.5" fill="#6b7280">routes/ingest.py · structured_ingest.py</text>
+  <text x="54" y="156" font-size="10.5" fill="#6b7280">确定性切分(场次头/章节/滑窗)</text>
+  <text x="54" y="172" font-size="10.5" fill="#6b7280">记录 analysis_run(可续跑)</text>
+
+  <rect x="270" y="92" width="215" height="100" rx="10" fill="#eef5ff" stroke="#5b8dd9"/>
+  <text x="284" y="118" font-size="13.5" font-weight="bold" fill="#1f2937">② 角色 / 场景抽取</text>
+  <text x="284" y="140" font-size="10.5" fill="#6b7280">structured_extraction.py</text>
+  <text x="284" y="156" font-size="10.5" fill="#6b7280">逐字证据校验 · 保守合并</text>
+  <text x="284" y="172" font-size="10.5" fill="#6b7280">LLM 归一裁决 · 原子发布 SQLite</text>
+
+  <rect x="500" y="92" width="215" height="100" rx="10" fill="#eef5ff" stroke="#5b8dd9"/>
+  <text x="514" y="118" font-size="13.5" font-weight="bold" fill="#1f2937">③ 分集规划</text>
+  <text x="514" y="140" font-size="10.5" fill="#6b7280">episodes.py · chapters 模式(默认)</text>
+  <text x="514" y="156" font-size="10.5" fill="#6b7280">EpisodePlannerAgent 为 legacy</text>
+  <text x="514" y="172" font-size="10.5" fill="#6b7280">(planning_mode=ai 才启用)</text>
+
+  <rect x="730" y="92" width="215" height="100" rx="10" fill="#eef5ff" stroke="#5b8dd9"/>
+  <text x="744" y="118" font-size="13.5" font-weight="bold" fill="#1f2937">④ 身份 + 资产编译</text>
+  <text x="744" y="140" font-size="10.5" fill="#6b7280">identity_planner.py · asset_compiler.py</text>
+  <text x="744" y="156" font-size="10.5" fill="#6b7280">默认身份/年龄变体/换装</text>
+  <text x="744" y="172" font-size="10.5" fill="#6b7280">场景/道具菜单(逐集编译)</text>
+
+  <rect x="960" y="92" width="215" height="100" rx="10" fill="#eef5ff" stroke="#5b8dd9"/>
+  <text x="974" y="118" font-size="13.5" font-weight="bold" fill="#1f2937">⑤ 解说改写(可选)</text>
+  <text x="974" y="140" font-size="10.5" fill="#6b7280">content_rewriter.py</text>
+  <text x="974" y="156" font-size="10.5" fill="#6b7280">原文 → 逐行口播文本</text>
+  <text x="974" y="172" font-size="10.5" fill="#6b7280">每行 = 1 个 beat · TTS 听感优先</text>
+
+  <line x1="255" y1="142" x2="268" y2="142" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw2)"/>
+  <line x1="485" y1="142" x2="498" y2="142" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw2)"/>
+  <line x1="715" y1="142" x2="728" y2="142" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw2)"/>
+  <line x1="945" y1="142" x2="958" y2="142" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw2)"/>
+
+  <!-- 换行箭头 -->
+  <line x1="1067" y1="192" x2="1067" y2="316" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw2)"/>
+  <text x="1077" y="258" font-size="10.5" fill="#94a3b8">逐集进入</text>
+
+  <!-- 第二行 6→10(自右向左) -->
+  <rect x="960" y="318" width="215" height="100" rx="10" fill="#eef5ff" stroke="#5b8dd9"/>
+  <text x="974" y="344" font-size="13.5" font-weight="bold" fill="#1f2937">⑥ 逐行 beat 化</text>
+  <text x="974" y="366" font-size="10.5" fill="#6b7280">literal_script_writing.py</text>
+  <text x="974" y="382" font-size="10.5" fill="#6b7280">audio_type / speaker 标注</text>
+  <text x="974" y="398" font-size="10.5" fill="#6b7280">visual_description + ID 标记</text>
+
+  <rect x="730" y="318" width="215" height="100" rx="10" fill="#eef5ff" stroke="#5b8dd9"/>
+  <text x="744" y="344" font-size="13.5" font-weight="bold" fill="#1f2937">⑦ 草图网格</text>
+  <text x="744" y="366" font-size="10.5" fill="#6b7280">nanobanana_grid.py · grid_splitter</text>
+  <text x="744" y="382" font-size="10.5" fill="#6b7280">多格分镜图 → 逐 beat 切分</text>
+  <text x="744" y="398" font-size="10.5" fill="#6b7280">角色颜色标记映射</text>
+
+  <rect x="500" y="318" width="215" height="100" rx="10" fill="#eef5ff" stroke="#5b8dd9"/>
+  <text x="514" y="344" font-size="13.5" font-weight="bold" fill="#1f2937">⑧ 运动提示词</text>
+  <text x="514" y="366" font-size="10.5" fill="#6b7280">global_video_optimizer.py</text>
+  <text x="514" y="382" font-size="10.5" fill="#6b7280">草图帧 + 颜色映射(多模态)</text>
+  <text x="514" y="398" font-size="10.5" fill="#6b7280">prev/next 上下文连贯性</text>
+
+  <rect x="270" y="318" width="215" height="100" rx="10" fill="#eef5ff" stroke="#5b8dd9"/>
+  <text x="284" y="344" font-size="13.5" font-weight="bold" fill="#1f2937">⑨ 图生视频</text>
+  <text x="284" y="366" font-size="10.5" fill="#6b7280">seedance / newapi 等 7 后端</text>
+  <text x="284" y="382" font-size="10.5" fill="#6b7280">seedance2_i2v 面板管线</text>
+  <text x="284" y="398" font-size="10.5" fill="#6b7280">对白/旁白声音克隆 IndexTTS2</text>
+
+  <rect x="40" y="318" width="215" height="100" rx="10" fill="#eef5ff" stroke="#5b8dd9"/>
+  <text x="54" y="344" font-size="13.5" font-weight="bold" fill="#1f2937">⑩ 合成导出</text>
+  <text x="54" y="366" font-size="10.5" fill="#6b7280">video_composer.py · ffmpeg</text>
+  <text x="54" y="382" font-size="10.5" fill="#6b7280">SRT 字幕 · ZIP 打包</text>
+  <text x="54" y="398" font-size="10.5" fill="#6b7280">output/…/videos/episodes</text>
+
+  <line x1="960" y1="368" x2="947" y2="368" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw2)"/>
+  <line x1="730" y1="368" x2="717" y2="368" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw2)"/>
+  <line x1="500" y1="368" x2="487" y2="368" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw2)"/>
+  <line x1="270" y1="368" x2="257" y2="368" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw2)"/>
+
+  <!-- 门禁/任务化说明 -->
+  <line x1="597" y1="418" x2="597" y2="466" stroke="#9aa7b4" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arw2)"/>
+  <rect x="40" y="470" width="1135" height="112" rx="10" fill="#edfaf0" stroke="#a9d8b8"/>
+  <text x="56" y="494" font-size="13.5" font-weight="bold" fill="#3f9d63">质量门禁 · verification/ 贯穿全程</text>
+  <text x="56" y="514" font-size="11" fill="#374151">草图视觉闸 sketch_visual_gate · 渲染身份防护 render_identity_guard · 一致性/连续性校验 · 失败样本回收 training_db</text>
+  <text x="56" y="542" font-size="13.5" font-weight="bold" fill="#d96b5b">任务化执行 · task_backend/</text>
+  <text x="56" y="562" font-size="11" fill="#374151">每步均为进程内后台任务 · SSE 实时进度 · 可取消 · 断点续跑(analysis_run / 逐 chunk 缓存回放) · 五级限流防上游过载</text>
+</svg>

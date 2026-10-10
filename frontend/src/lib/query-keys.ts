@@ -34,6 +34,9 @@ export const queryKeys = {
     ["users", "search", project, q] as const,
   pipelineStatus: (p: string) => ["projects", p, "pipeline-status"] as const,
   characters: (p: string) => ["projects", p, "characters"] as const,
+  screenplays: (p: string) => ["projects", p, "screenplays"] as const,
+  screenplay: (p: string, id: string) =>
+    ["projects", p, "screenplays", id] as const,
   characterDetails: (p: string, name: string) =>
     ["projects", p, "characters", "details", name] as const,
   character: (p: string, name: string) =>

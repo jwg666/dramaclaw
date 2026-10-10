@@ -164,6 +164,28 @@ class ScriptGenerateRequest(BaseModel):
     pass
 
 
+class ScreenplayCreateRequest(BaseModel):
+    title: str
+    synopsis: str = ""
+    content: str = ""
+
+
+class ScreenplayUpdateRequest(BaseModel):
+    """剧本稿件更新：全部字段可选，未传的字段不更新（自动保存只带 content）。"""
+
+    title: Optional[str] = None
+    synopsis: Optional[str] = None
+    content: Optional[str] = None
+    status: Optional[Literal["draft", "final"]] = None
+
+
+class ScreenplayAiAssistRequest(BaseModel):
+    """AI 辅助请求。selection 非空时只作用于选中文本，否则作用于全文。"""
+
+    selection: str = ""
+    instruction: str = ""
+
+
 class BeatUpdate(BaseModel):
     narration_segment: Optional[str] = None
     visual_description: Optional[str] = None

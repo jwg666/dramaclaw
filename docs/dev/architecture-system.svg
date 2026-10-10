@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 950" font-family="Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif">
+  <defs>
+    <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9aa7b4"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1240" height="950" fill="#ffffff"/>
+  <text x="40" y="42" font-size="22" font-weight="bold" fill="#111827">DramaClaw CE 系统架构</text>
+  <text x="40" y="64" font-size="13" fill="#64748b">单机「小说 → 短剧成片」流水线 · FastAPI :8780 · SQLite · newAPI 网关 :3000 · 无 PostgreSQL / Redis</text>
+
+  <!-- 图例 -->
+  <rect x="950" y="84" width="250" height="120" rx="10" fill="#fafafa" stroke="#d1d5db"/>
+  <text x="962" y="106" font-size="12.5" font-weight="bold" fill="#374151">图例</text>
+  <line x1="962" y1="124" x2="1002" y2="124" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw)"/>
+  <text x="1010" y="128" font-size="11" fill="#6b7280">同步调用(REST)</text>
+  <line x1="962" y1="148" x2="1002" y2="148" stroke="#9aa7b4" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arw)"/>
+  <text x="1010" y="152" font-size="11" fill="#6b7280">异步任务(SSE 进度)</text>
+  <rect x="962" y="166" width="40" height="14" fill="#eef2f5" stroke="#d1d5db"/>
+  <text x="1010" y="178" font-size="11" fill="#6b7280">模型接入面(右列)</text>
+
+  <!-- 客户端层 -->
+  <rect x="40" y="84" width="880" height="100" rx="10" fill="#eef5ff" stroke="#b9d2ee"/>
+  <text x="56" y="106" font-size="12" font-weight="bold" fill="#4a78b8">客户端层</text>
+  <rect x="60" y="116" width="410" height="54" rx="8" fill="#ffffff" stroke="#5b8dd9"/>
+  <text x="74" y="138" font-size="14" font-weight="bold" fill="#1f2937">React 前端 · :8080</text>
+  <text x="74" y="157" font-size="11" fill="#6b7280">React 19 · TanStack Router/Query · Zustand · xyflow / Konva / PlayCanvas</text>
+  <rect x="490" y="116" width="410" height="54" rx="8" fill="#ffffff" stroke="#5b8dd9"/>
+  <text x="504" y="138" font-size="14" font-weight="bold" fill="#1f2937">AI Agent 操作端</text>
+  <text x="504" y="157" font-size="11" fill="#6b7280">MCP(.mcp.json) · Hermes skill playbooks · Bearer 会话</text>
+  <line x1="265" y1="170" x2="265" y2="206" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw)"/>
+  <line x1="695" y1="170" x2="695" y2="206" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw)"/>
+
+  <!-- API 层 -->
+  <rect x="40" y="208" width="880" height="110" rx="10" fill="#f3eeff" stroke="#cbb8f0"/>
+  <text x="56" y="228" font-size="12" font-weight="bold" fill="#7d5bd9">API 层</text>
+  <rect x="60" y="238" width="840" height="66" rx="8" fill="#ffffff" stroke="#7d5bd9"/>
+  <text x="76" y="260" font-size="14" font-weight="bold" fill="#1f2937">FastAPI 应用 · :8780 — api/app.py · routes/ 22 模块 · 约 312 端点</text>
+  <text x="76" y="279" font-size="11" fill="#6b7280">中间件:请求体限制 · 资源日志 | 异常映射:限流 429 · 计费 402 · 授权 403</text>
+  <text x="76" y="296" font-size="11" fill="#6b7280">deps.py → ProjectContext(按请求开关 SQLite/Cognee Store) · auth:cookie st_session / Bearer</text>
+  <line x1="480" y1="318" x2="480" y2="350" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw)"/>
+
+  <!-- API → 任务后侧路(虚线) -->
+  <path d="M900,271 H932 V724 H906" fill="none" stroke="#9aa7b4" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arw)"/>
+  <text x="940" y="500" font-size="10.5" fill="#94a3b8" text-anchor="middle" transform="rotate(90 940 500)">任务提交 / SSE 进度</text>
+
+  <!-- 端口层 -->
+  <rect x="40" y="352" width="880" height="98" rx="10" fill="#fff8e6" stroke="#e4cf96"/>
+  <text x="56" y="372" font-size="12" font-weight="bold" fill="#b8863f">端口层 · Ports / Adapters(六边形架构)</text>
+  <rect x="60" y="382" width="840" height="54" rx="8" fill="#ffffff" stroke="#c9a227"/>
+  <text x="76" y="402" font-size="14" font-weight="bold" fill="#1f2937">ports/ — Protocol 注册表 · 核心代码永不 import 企业实现</text>
+  <text x="76" y="421" font-size="11" fill="#6b7280">ST_EDITION=ce → ports/local 内置实现(auth · project_registry · task_backend · cancellation · usage_meter · credit_quote · audit · lifecycle …)</text>
+  <line x1="480" y1="450" x2="480" y2="484" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw)"/>
+
+  <!-- 创作引擎 -->
+  <rect x="40" y="486" width="880" height="160" rx="10" fill="#edfaf0" stroke="#a9d8b8"/>
+  <text x="56" y="506" font-size="12" font-weight="bold" fill="#3f9d63">创作引擎</text>
+  <rect x="60" y="516" width="162" height="116" rx="8" fill="#ffffff" stroke="#3f9d63"/>
+  <text x="74" y="536" font-size="13" font-weight="bold" fill="#1f2937">agents/</text>
+  <text x="74" y="554" font-size="10.5" fill="#6b7280">pydantic-ai 智能体</text>
+  <text x="74" y="570" font-size="10.5" fill="#6b7280">分集/身份/资产规划</text>
+  <text x="74" y="586" font-size="10.5" fill="#6b7280">视频/关键帧提示词</text>
+  <text x="74" y="602" font-size="10.5" fill="#6b7280">结构化输出校验</text>
+  <rect x="229" y="516" width="162" height="116" rx="8" fill="#ffffff" stroke="#3f9d63"/>
+  <text x="243" y="536" font-size="13" font-weight="bold" fill="#1f2937">cognee/ structured_*</text>
+  <text x="243" y="554" font-size="10.5" fill="#6b7280">小说摄取 · 双管线</text>
+  <text x="243" y="570" font-size="10.5" fill="#6b7280">知识图谱(legacy)</text>
+  <text x="243" y="586" font-size="10.5" fill="#6b7280">逐片段抽取(主路径)</text>
+  <text x="243" y="602" font-size="10.5" fill="#6b7280">证据校验 · 原子发布</text>
+  <rect x="398" y="516" width="162" height="116" rx="8" fill="#ffffff" stroke="#3f9d63"/>
+  <text x="412" y="536" font-size="13" font-weight="bold" fill="#1f2937">generators/</text>
+  <text x="412" y="554" font-size="10.5" fill="#6b7280">图片 LingShan / NB</text>
+  <text x="412" y="570" font-size="10.5" fill="#6b7280">视频 7 种后端</text>
+  <text x="412" y="586" font-size="10.5" fill="#6b7280">TTS Edge / CosyVoice</text>
+  <text x="412" y="602" font-size="10.5" fill="#6b7280">prompt_builder 三策略</text>
+  <rect x="567" y="516" width="162" height="116" rx="8" fill="#ffffff" stroke="#3f9d63"/>
+  <text x="581" y="536" font-size="13" font-weight="bold" fill="#1f2937">verification/</text>
+  <text x="581" y="554" font-size="10.5" fill="#6b7280">一致性 / 连续性</text>
+  <text x="581" y="570" font-size="10.5" fill="#6b7280">草图视觉闸</text>
+  <text x="581" y="586" font-size="10.5" fill="#6b7280">相似度检测</text>
+  <text x="581" y="602" font-size="10.5" fill="#6b7280">训练样本库</text>
+  <rect x="736" y="516" width="162" height="116" rx="8" fill="#ffffff" stroke="#3f9d63"/>
+  <text x="750" y="536" font-size="13" font-weight="bold" fill="#1f2937">seedance2_i2v · export</text>
+  <text x="750" y="554" font-size="10.5" fill="#6b7280">图生视频面板管线</text>
+  <text x="750" y="570" font-size="10.5" fill="#6b7280">对白/旁白声音克隆</text>
+  <text x="750" y="586" font-size="10.5" fill="#6b7280">SRT / ZIP 导出</text>
+  <text x="750" y="602" font-size="10.5" fill="#6b7280">workflows 逐行剧本</text>
+
+  <!-- 引擎 ⇄ 任务后端 -->
+  <line x1="430" y1="646" x2="430" y2="698" stroke="#9aa7b4" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arw)"/>
+  <text x="438" y="676" font-size="10.5" fill="#94a3b8">提交</text>
+  <line x1="560" y1="698" x2="560" y2="648" stroke="#9aa7b4" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arw)"/>
+  <text x="568" y="676" font-size="10.5" fill="#94a3b8">runner 调用引擎</text>
+
+  <!-- 任务后端 -->
+  <rect x="40" y="700" width="880" height="104" rx="10" fill="#fff0ee" stroke="#f0c1b5"/>
+  <text x="56" y="720" font-size="12" font-weight="bold" fill="#d96b5b">任务后端 · task_backend/(CE = 进程内 inline)</text>
+  <rect x="60" y="730" width="840" height="60" rx="8" fill="#ffffff" stroke="#d96b5b"/>
+  <text x="76" y="750" font-size="13.5" font-weight="bold" fill="#1f2937">HMAC 签名信封 → 队列 · 五级限流 → inline runner ×15</text>
+  <text x="76" y="767" font-size="10.5" fill="#6b7280">runners:graph_build · identity · character_image · scene/prop_reference · episode_assets · script · sketch · render · video · audio · stage_asset · freezone …</text>
+  <text x="76" y="783" font-size="10.5" fill="#6b7280">取消监听 · 子进程出网管控(剥密钥/拦网络) · 计费预留与退券 · SSE 进度上报</text>
+  <line x1="480" y1="804" x2="480" y2="834" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw)"/>
+
+  <!-- 本地存储 -->
+  <rect x="40" y="836" width="880" height="88" rx="10" fill="#f5f6f7" stroke="#d5d9de"/>
+  <text x="56" y="856" font-size="12" font-weight="bold" fill="#64748b">本地存储(被 API · 引擎 · runner 共同读写)</text>
+  <rect x="60" y="862" width="272" height="48" rx="8" fill="#ffffff" stroke="#9aa7b4"/>
+  <text x="74" y="880" font-size="12" font-weight="bold" fill="#1f2937">state/〈user〉/〈project〉/data.db</text>
+  <text x="74" y="897" font-size="10.5" fill="#6b7280">SQLite WAL · characters/episodes/scenes/props/beats · 任务/用量表</text>
+  <rect x="344" y="862" width="272" height="48" rx="8" fill="#ffffff" stroke="#9aa7b4"/>
+  <text x="358" y="880" font-size="12" font-weight="bold" fill="#1f2937">output/〈user〉/〈project〉/</text>
+  <text x="358" y="897" font-size="10.5" fill="#6b7280">参考图 · 草图 · 成片 · 音频 · 3DGS/SOG · epXXX.srt</text>
+  <rect x="628" y="862" width="272" height="48" rx="8" fill="#ffffff" stroke="#9aa7b4"/>
+  <text x="642" y="880" font-size="12" font-weight="bold" fill="#1f2937">project_config.json · settings.db</text>
+  <text x="642" y="897" font-size="10.5" fill="#6b7280">项目级模型/风格配置 · 网关凭据 · OSS relay</text>
+
+  <!-- 模型网关(右列) -->
+  <rect x="950" y="470" width="250" height="100" rx="10" fill="#eef2f5" stroke="#5b7dd9"/>
+  <text x="1075" y="496" font-size="14" font-weight="bold" fill="#1f2937" text-anchor="middle">newAPI 模型网关 · :3000</text>
+  <text x="1075" y="516" font-size="11" fill="#6b7280" text-anchor="middle">官方 RelayClaw / 本地 NewAPI</text>
+  <text x="1075" y="534" font-size="11" fill="#6b7280" text-anchor="middle">OpenAI 兼容协议</text>
+  <text x="1075" y="552" font-size="10.5" fill="#94a3b8" text-anchor="middle">运行凭据存 settings.db</text>
+  <line x1="920" y1="556" x2="948" y2="524" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw)"/>
+  <rect x="950" y="620" width="250" height="170" rx="10" fill="#fdf6ec" stroke="#b8863f"/>
+  <text x="1075" y="646" font-size="14" font-weight="bold" fill="#1f2937" text-anchor="middle">上游模型</text>
+  <text x="1075" y="670" font-size="11" fill="#6b7280" text-anchor="middle">文本 · gemini / gpt / qwen</text>
+  <text x="1075" y="690" font-size="11" fill="#6b7280" text-anchor="middle">图片 · LingShan-G2 / NB-2</text>
+  <text x="1075" y="710" font-size="11" fill="#6b7280" text-anchor="middle">视频 · Seedance 1.x / 2.0</text>
+  <text x="1075" y="730" font-size="11" fill="#6b7280" text-anchor="middle">音频 · IndexTTS2 / CosyVoice</text>
+  <text x="1075" y="754" font-size="10.5" fill="#94a3b8" text-anchor="middle">参考图经 OSS relay 签名 URL</text>
+  <line x1="1075" y1="570" x2="1075" y2="618" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arw)"/>
+
+  <text x="40" y="940" font-size="11" fill="#94a3b8">EE 企业版以适配器替换端口实现(多租户 auth · PG registry · Celery task_backend · 计费计量),核心引擎代码同一套 · CE 单机免登录单用户(ST_EDITION=ce)</text>
+</svg>

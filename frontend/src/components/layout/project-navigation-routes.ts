@@ -4,6 +4,7 @@
 export const PROJECT_SECTION_ROUTES = {
   freezone: "/projects/$project/freezone",
   ingest: "/projects/$project/ingest",
+  screenplays: "/projects/$project/screenplays",
   characters: "/projects/$project/characters",
   episodes: "/projects/$project/episodes",
   styles: "/projects/$project/styles",

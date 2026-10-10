@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import aiosqlite
 from rich.console import Console
+from ulid import ULID
 
 from novelvideo.freezone.workflow_drafts import WORKFLOW_DRAFT_SCHEMA_SQL
 from novelvideo.freezone.workflow_runs import WORKFLOW_RUN_SCHEMA_SQL
@@ -392,13 +393,29 @@ CREATE TABLE IF NOT EXISTS story_analysis_item_cache (
 
 CREATE INDEX IF NOT EXISTS idx_item_cache_type
     ON story_analysis_item_cache(artifact_type);
+
+-- 剧本设计：项目级在线剧本文档。一个项目可保存多份稿件（不同故事/版本），
+-- 「作为源文导入」会把稿件落成 uploads/*.txt 走标准 ingest 流程；本表只管
+-- 稿件本身，不承载导入状态（novel.txt 仍是导入成功的标记文件）。
+CREATE TABLE IF NOT EXISTS screenplays (
+    id            TEXT PRIMARY KEY,
+    title         TEXT NOT NULL,
+    synopsis      TEXT NOT NULL DEFAULT '',
+    content       TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'draft',
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_screenplays_updated
+    ON screenplays(updated_at);
 """
 
 _PROJECT_STORE_SCHEMA_COMPONENT = "project_store"
 # MIGRATION CONTRACT: increment this whenever SQLITE_SCHEMA_SQL or any
 # _ensure_*_columns migration above changes. Existing databases skip the
 # initializer after this version has been recorded.
-_PROJECT_STORE_SCHEMA_VERSION = 4
+# v5: 新增 screenplays 表（剧本设计）。纯新增表，旧库经重跑 initializer 补建。
+_PROJECT_STORE_SCHEMA_VERSION = 5
 
 
 def _table_columns(db: sqlite3.Connection, table: str) -> set[str]:
@@ -698,6 +715,96 @@ class SQLiteStore:
 
     def load_novel_content(self) -> Optional[str]:
         return load_imported_novel_content(self.project_dir)
+
+    # ── 剧本设计（screenplays）────────────────────────────────────────────
+    # 写路径一律整行更新本表：剧本稿件是单人文档（项目内无并发协作语义），
+    # 不像 episodes 行那样被规划/资产编译并发写不同列，所以不需要列级 patch。
+    # updated_at 由 SQL 侧刷新，避免客户端时钟参与。
+
+    async def list_screenplays(self) -> List[dict]:
+        """项目下全部剧本（按更新时间倒序）。列表不含正文，只含长度。"""
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT id, title, synopsis, status, length(content) AS char_count, "
+            "created_at, updated_at FROM screenplays "
+            "ORDER BY updated_at DESC, id DESC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_screenplay(self, screenplay_id: str) -> Optional[dict]:
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT id, title, synopsis, content, status, created_at, updated_at "
+            "FROM screenplays WHERE id = ?",
+            (screenplay_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def create_screenplay(
+        self,
+        *,
+        title: str,
+        synopsis: str = "",
+        content: str = "",
+        status: str = "draft",
+    ) -> dict:
+        screenplay_id = str(ULID())
+        db = await self._ensure_db()
+        await db.execute(
+            "INSERT INTO screenplays (id, title, synopsis, content, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (screenplay_id, title, synopsis, content, status),
+        )
+        await db.commit()
+        document = await self.get_screenplay(screenplay_id)
+        assert document is not None  # 刚插入的行必然存在
+        return document
+
+    async def update_screenplay(
+        self,
+        screenplay_id: str,
+        *,
+        title: Optional[str] = None,
+        synopsis: Optional[str] = None,
+        content: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> Optional[dict]:
+        """列级更新：只写调用方显式传入的字段（自动保存只带 content）。"""
+        assignments: List[str] = []
+        params: List[Any] = []
+        for column, value in (
+            ("title", title),
+            ("synopsis", synopsis),
+            ("content", content),
+            ("status", status),
+        ):
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                params.append(value)
+        if not assignments:
+            return await self.get_screenplay(screenplay_id)
+        assignments.append("updated_at = datetime('now')")
+        params.append(screenplay_id)
+        db = await self._ensure_db()
+        cursor = await db.execute(
+            f"UPDATE screenplays SET {', '.join(assignments)} WHERE id = ?",
+            params,
+        )
+        await db.commit()
+        if cursor.rowcount == 0:
+            return None
+        return await self.get_screenplay(screenplay_id)
+
+    async def delete_screenplay(self, screenplay_id: str) -> bool:
+        db = await self._ensure_db()
+        cursor = await db.execute(
+            "DELETE FROM screenplays WHERE id = ?",
+            (screenplay_id,),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
     async def save_episode_content(self, ep_num: int, content: str) -> None:
         db = await self._ensure_db()
