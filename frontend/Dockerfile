@@ -19,6 +19,10 @@ ENV VITE_EDITION=${VITE_EDITION}
 # corepack picks the version pinned in package.json's "packageManager" field.
 # pnpm-workspace.yaml is required here: it carries the allowBuilds approvals that
 # keep `pnpm install` from erroring on skipped (unneeded) dependency build scripts.
+# 国内构建加速:pnpm/corepack 走 npmmirror(--build-arg NPM_REGISTRY=官方源 可还原)
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+ENV npm_config_registry=${NPM_REGISTRY} \
+    COREPACK_NPM_REGISTRY=${NPM_REGISTRY}
 RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile

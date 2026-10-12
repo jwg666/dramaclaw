@@ -29,7 +29,8 @@ COPY --from=vtracer-builder /usr/local/cargo/bin/vtracer /usr/local/bin/vtracer
 # 项目全程用 uv 管理(与 host 一致)。Dockerfile 也用 uv,使 uv.lock 锁版本 +
 # [[tool.uv.dependency-metadata]] override(da2 的 torch==2.5.0 冲突、sharp 的 gsplat)
 # 生效——pip 不认这些 override,会在 da2/world 解析冲突时 build 失败。
-RUN pip install --no-cache-dir uv
+# 国内构建加速：pip 走清华镜像（可还原为官方源）
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple uv
 
 ENV ST_EDITION=ce \
     ST_CONTROL_PLANE_DSN= \
@@ -41,6 +42,7 @@ ENV ST_EDITION=ce \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/app/.venv \
+    UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple \
     HERMES_CLI_PATH=/usr/local/bin/hermes \
     CODEX_BIN=/usr/local/bin/codex-dramaclaw
 
@@ -52,7 +54,9 @@ COPY --from=codex-runtime /codex-runtime.json /opt/codex-runtime.json
 # vendored codex-linux-sandbox binary's default pipeline execs system bwrap
 # (Landlock is only its --use-legacy-landlock fallback, which we do not use).
 # The binary itself is installed further down, per TARGETARCH.
-RUN apt-get update \
+# 国内构建加速:apt 走清华 Debian 镜像(后续 RUN 复用已改的 sources)
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g; s|security.debian.org|mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
