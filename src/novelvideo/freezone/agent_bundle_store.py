@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - production images are Linux
+    fcntl = None
 
 from copy import deepcopy
 from importlib.metadata import PackageNotFoundError, version
@@ -47,7 +50,8 @@ def install_agent_bundle(*, username: str, payload: dict[str, Any]) -> dict[str,
     root = user_agent_config_dir(username, "skills").parent
     root.mkdir(parents=True, exist_ok=True)
     with (root / ".bundle-install.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
         return _install_agent_bundle_unlocked(username=username, payload=payload)
 
 

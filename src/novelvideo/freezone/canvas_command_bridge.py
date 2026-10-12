@@ -7,7 +7,10 @@ remain as a temporary compatibility mirror for legacy workers.
 
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - production images are Linux
+    fcntl = None
 import hashlib
 import json
 import os
@@ -648,11 +651,13 @@ def _key_lock(key: str, bridge_dir: str | Path | None = None):
     safe_key = "".join(ch for ch in key if ch.isalnum() or ch in {"-", "_"})[:128]
     lock_path = directory / f"{safe_key}.lock"
     with lock_path.open("a+") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _canvas_command_idempotency_conflict(
