@@ -1876,6 +1876,8 @@
     "deleteSuccess": "剧本已删除",
     "deleteFailed": "删除剧本失败",
     "statusFinal": "定稿",
+    "edit": "编辑",
+    "cardHint": "双击剧本卡片进入编辑，或点卡片右上角的编辑按钮",
     "back": "返回列表",
     "save": "保存",
     "saved": "已保存",

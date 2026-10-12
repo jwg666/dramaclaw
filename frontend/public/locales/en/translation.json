@@ -1876,6 +1876,8 @@
     "deleteSuccess": "Screenplay deleted",
     "deleteFailed": "Failed to delete screenplay",
     "statusFinal": "Final",
+    "edit": "Edit",
+    "cardHint": "Double-click a card to edit, or use the edit button on the card",
     "back": "Back to list",
     "save": "Save",
     "saved": "Saved",

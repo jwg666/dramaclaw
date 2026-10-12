@@ -22,6 +22,7 @@ import { Route as AppCreditsRouteImport } from './routes/_app/credits'
 import { Route as AppAccessUnavailableRouteImport } from './routes/_app/access-unavailable'
 import { Route as AppProjectsProjectTasksRouteImport } from './routes/_app/projects.$project/tasks'
 import { Route as AppProjectsProjectStylesRouteImport } from './routes/_app/projects.$project/styles'
+import { Route as AppProjectsProjectScreenplaysRouteImport } from './routes/_app/projects.$project/screenplays'
 import { Route as AppProjectsProjectIngestRouteImport } from './routes/_app/projects.$project/ingest'
 import { Route as AppProjectsProjectEpisodesRouteImport } from './routes/_app/projects.$project/episodes'
 import { Route as AppProjectsProjectAssistantRouteImport } from './routes/_app/projects.$project/assistant'
@@ -33,6 +34,8 @@ const AppProjectsProjectFreezoneLazyRouteImport = createFileRoute(
 const AppProjectsProjectCharactersLazyRouteImport = createFileRoute(
   '/_app/projects/$project/characters',
 )()
+const AppProjectsProjectScreenplaysScreenplayIdLazyRouteImport =
+  createFileRoute('/_app/projects/$project/screenplays/$screenplayId')()
 const AppProjectsProjectEpisodesEpisodeIndexLazyRouteImport = createFileRoute(
   '/_app/projects/$project/episodes/$episode/',
 )()
@@ -136,6 +139,12 @@ const AppProjectsProjectStylesRoute =
     path: '/projects/$project/styles',
     getParentRoute: () => AppRoute,
   } as any)
+const AppProjectsProjectScreenplaysRoute =
+  AppProjectsProjectScreenplaysRouteImport.update({
+    id: '/projects/$project/screenplays',
+    path: '/projects/$project/screenplays',
+    getParentRoute: () => AppRoute,
+  } as any)
 const AppProjectsProjectIngestRoute =
   AppProjectsProjectIngestRouteImport.update({
     id: '/projects/$project/ingest',
@@ -154,6 +163,16 @@ const AppProjectsProjectAssistantRoute =
     path: '/projects/$project/assistant',
     getParentRoute: () => AppRoute,
   } as any)
+const AppProjectsProjectScreenplaysScreenplayIdLazyRoute =
+  AppProjectsProjectScreenplaysScreenplayIdLazyRouteImport.update({
+    id: '/$screenplayId',
+    path: '/$screenplayId',
+    getParentRoute: () => AppProjectsProjectScreenplaysRoute,
+  } as any).lazy(() =>
+    import('./routes/_app/projects.$project/screenplays.$screenplayId.lazy').then(
+      (d) => d.Route,
+    ),
+  )
 const AppProjectsProjectEpisodesEpisodeIndexLazyRoute =
   AppProjectsProjectEpisodesEpisodeIndexLazyRouteImport.update({
     id: '/$episode/',
@@ -248,10 +267,12 @@ export interface FileRoutesByFullPath {
   '/projects/$project/assistant': typeof AppProjectsProjectAssistantRoute
   '/projects/$project/episodes': typeof AppProjectsProjectEpisodesRouteWithChildren
   '/projects/$project/ingest': typeof AppProjectsProjectIngestRoute
+  '/projects/$project/screenplays': typeof AppProjectsProjectScreenplaysRouteWithChildren
   '/projects/$project/styles': typeof AppProjectsProjectStylesRoute
   '/projects/$project/tasks': typeof AppProjectsProjectTasksRoute
   '/projects/$project/characters': typeof AppProjectsProjectCharactersLazyRoute
   '/projects/$project/freezone': typeof AppProjectsProjectFreezoneLazyRoute
+  '/projects/$project/screenplays/$screenplayId': typeof AppProjectsProjectScreenplaysScreenplayIdLazyRoute
   '/projects/$project/episodes/$episode/audio': typeof AppProjectsProjectEpisodesEpisodeAudioLazyRoute
   '/projects/$project/episodes/$episode/beats': typeof AppProjectsProjectEpisodesEpisodeBeatsLazyRoute
   '/projects/$project/episodes/$episode/compose': typeof AppProjectsProjectEpisodesEpisodeComposeLazyRoute
@@ -274,10 +295,12 @@ export interface FileRoutesByTo {
   '/projects/$project/assistant': typeof AppProjectsProjectAssistantRoute
   '/projects/$project/episodes': typeof AppProjectsProjectEpisodesRouteWithChildren
   '/projects/$project/ingest': typeof AppProjectsProjectIngestRoute
+  '/projects/$project/screenplays': typeof AppProjectsProjectScreenplaysRouteWithChildren
   '/projects/$project/styles': typeof AppProjectsProjectStylesRoute
   '/projects/$project/tasks': typeof AppProjectsProjectTasksRoute
   '/projects/$project/characters': typeof AppProjectsProjectCharactersLazyRoute
   '/projects/$project/freezone': typeof AppProjectsProjectFreezoneLazyRoute
+  '/projects/$project/screenplays/$screenplayId': typeof AppProjectsProjectScreenplaysScreenplayIdLazyRoute
   '/projects/$project/episodes/$episode/audio': typeof AppProjectsProjectEpisodesEpisodeAudioLazyRoute
   '/projects/$project/episodes/$episode/beats': typeof AppProjectsProjectEpisodesEpisodeBeatsLazyRoute
   '/projects/$project/episodes/$episode/compose': typeof AppProjectsProjectEpisodesEpisodeComposeLazyRoute
@@ -302,10 +325,12 @@ export interface FileRoutesById {
   '/_app/projects/$project/assistant': typeof AppProjectsProjectAssistantRoute
   '/_app/projects/$project/episodes': typeof AppProjectsProjectEpisodesRouteWithChildren
   '/_app/projects/$project/ingest': typeof AppProjectsProjectIngestRoute
+  '/_app/projects/$project/screenplays': typeof AppProjectsProjectScreenplaysRouteWithChildren
   '/_app/projects/$project/styles': typeof AppProjectsProjectStylesRoute
   '/_app/projects/$project/tasks': typeof AppProjectsProjectTasksRoute
   '/_app/projects/$project/characters': typeof AppProjectsProjectCharactersLazyRoute
   '/_app/projects/$project/freezone': typeof AppProjectsProjectFreezoneLazyRoute
+  '/_app/projects/$project/screenplays/$screenplayId': typeof AppProjectsProjectScreenplaysScreenplayIdLazyRoute
   '/_app/projects/$project/episodes/$episode/audio': typeof AppProjectsProjectEpisodesEpisodeAudioLazyRoute
   '/_app/projects/$project/episodes/$episode/beats': typeof AppProjectsProjectEpisodesEpisodeBeatsLazyRoute
   '/_app/projects/$project/episodes/$episode/compose': typeof AppProjectsProjectEpisodesEpisodeComposeLazyRoute
@@ -330,10 +355,12 @@ export interface FileRouteTypes {
     | '/projects/$project/assistant'
     | '/projects/$project/episodes'
     | '/projects/$project/ingest'
+    | '/projects/$project/screenplays'
     | '/projects/$project/styles'
     | '/projects/$project/tasks'
     | '/projects/$project/characters'
     | '/projects/$project/freezone'
+    | '/projects/$project/screenplays/$screenplayId'
     | '/projects/$project/episodes/$episode/audio'
     | '/projects/$project/episodes/$episode/beats'
     | '/projects/$project/episodes/$episode/compose'
@@ -356,10 +383,12 @@ export interface FileRouteTypes {
     | '/projects/$project/assistant'
     | '/projects/$project/episodes'
     | '/projects/$project/ingest'
+    | '/projects/$project/screenplays'
     | '/projects/$project/styles'
     | '/projects/$project/tasks'
     | '/projects/$project/characters'
     | '/projects/$project/freezone'
+    | '/projects/$project/screenplays/$screenplayId'
     | '/projects/$project/episodes/$episode/audio'
     | '/projects/$project/episodes/$episode/beats'
     | '/projects/$project/episodes/$episode/compose'
@@ -383,10 +412,12 @@ export interface FileRouteTypes {
     | '/_app/projects/$project/assistant'
     | '/_app/projects/$project/episodes'
     | '/_app/projects/$project/ingest'
+    | '/_app/projects/$project/screenplays'
     | '/_app/projects/$project/styles'
     | '/_app/projects/$project/tasks'
     | '/_app/projects/$project/characters'
     | '/_app/projects/$project/freezone'
+    | '/_app/projects/$project/screenplays/$screenplayId'
     | '/_app/projects/$project/episodes/$episode/audio'
     | '/_app/projects/$project/episodes/$episode/beats'
     | '/_app/projects/$project/episodes/$episode/compose'
@@ -506,6 +537,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppProjectsProjectStylesRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/projects/$project/screenplays': {
+      id: '/_app/projects/$project/screenplays'
+      path: '/projects/$project/screenplays'
+      fullPath: '/projects/$project/screenplays'
+      preLoaderRoute: typeof AppProjectsProjectScreenplaysRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/projects/$project/ingest': {
       id: '/_app/projects/$project/ingest'
       path: '/projects/$project/ingest'
@@ -526,6 +564,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/projects/$project/assistant'
       preLoaderRoute: typeof AppProjectsProjectAssistantRouteImport
       parentRoute: typeof AppRoute
+    }
+    '/_app/projects/$project/screenplays/$screenplayId': {
+      id: '/_app/projects/$project/screenplays/$screenplayId'
+      path: '/$screenplayId'
+      fullPath: '/projects/$project/screenplays/$screenplayId'
+      preLoaderRoute: typeof AppProjectsProjectScreenplaysScreenplayIdLazyRouteImport
+      parentRoute: typeof AppProjectsProjectScreenplaysRoute
     }
     '/_app/projects/$project/episodes/$episode/': {
       id: '/_app/projects/$project/episodes/$episode/'
@@ -622,6 +667,21 @@ const AppProjectsProjectEpisodesRouteWithChildren =
     AppProjectsProjectEpisodesRouteChildren,
   )
 
+interface AppProjectsProjectScreenplaysRouteChildren {
+  AppProjectsProjectScreenplaysScreenplayIdLazyRoute: typeof AppProjectsProjectScreenplaysScreenplayIdLazyRoute
+}
+
+const AppProjectsProjectScreenplaysRouteChildren: AppProjectsProjectScreenplaysRouteChildren =
+  {
+    AppProjectsProjectScreenplaysScreenplayIdLazyRoute:
+      AppProjectsProjectScreenplaysScreenplayIdLazyRoute,
+  }
+
+const AppProjectsProjectScreenplaysRouteWithChildren =
+  AppProjectsProjectScreenplaysRoute._addFileChildren(
+    AppProjectsProjectScreenplaysRouteChildren,
+  )
+
 interface AppRouteChildren {
   AppAccessUnavailableRoute: typeof AppAccessUnavailableRoute
   AppCreditsRoute: typeof AppCreditsRoute
@@ -630,6 +690,7 @@ interface AppRouteChildren {
   AppProjectsProjectAssistantRoute: typeof AppProjectsProjectAssistantRoute
   AppProjectsProjectEpisodesRoute: typeof AppProjectsProjectEpisodesRouteWithChildren
   AppProjectsProjectIngestRoute: typeof AppProjectsProjectIngestRoute
+  AppProjectsProjectScreenplaysRoute: typeof AppProjectsProjectScreenplaysRouteWithChildren
   AppProjectsProjectStylesRoute: typeof AppProjectsProjectStylesRoute
   AppProjectsProjectTasksRoute: typeof AppProjectsProjectTasksRoute
   AppProjectsProjectCharactersLazyRoute: typeof AppProjectsProjectCharactersLazyRoute
@@ -644,6 +705,8 @@ const AppRouteChildren: AppRouteChildren = {
   AppProjectsProjectAssistantRoute: AppProjectsProjectAssistantRoute,
   AppProjectsProjectEpisodesRoute: AppProjectsProjectEpisodesRouteWithChildren,
   AppProjectsProjectIngestRoute: AppProjectsProjectIngestRoute,
+  AppProjectsProjectScreenplaysRoute:
+    AppProjectsProjectScreenplaysRouteWithChildren,
   AppProjectsProjectStylesRoute: AppProjectsProjectStylesRoute,
   AppProjectsProjectTasksRoute: AppProjectsProjectTasksRoute,
   AppProjectsProjectCharactersLazyRoute: AppProjectsProjectCharactersLazyRoute,

@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
-import { createFileRoute, Link } from "@tanstack/react-router";
+import {
+  createFileRoute,
+  Link,
+  Outlet,
+  useNavigate,
+  useParams,
+} from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
-import { FileText, Loader2, Plus, Trash2 } from "lucide-react";
+import { FileText, Loader2, Pencil, Plus, Trash2 } from "lucide-react";
 
 import {
   useCreateScreenplay,
@@ -26,14 +32,21 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 
 export const SCREENPLAYS_INPUT_CLASS =
-  "h-9 rounded-[8px] border-white/10 bg-white/[0.025] px-3 text-sm shadow-none placeholder:text-muted-foreground/60 focus-visible:border-white/20 focus-visible:ring-2 focus-visible:ring-white/8 dark:bg-white/[0.025]";
+  "h-9 rounded-[8px] border border-border bg-card px-3 text-sm shadow-none placeholder:text-muted-foreground/60 focus-visible:border-ring/50 focus-visible:ring-2 focus-visible:ring-ring/20";
 
 function ScreenplaysPage() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const { project } = Route.useParams();
   const { data: response, isLoading } = useScreenplays(project);
   const createMutation = useCreateScreenplay(project);
   const deleteMutation = useDeleteScreenplay(project);
+
+  const openEditor = (screenplayId: string) =>
+    navigate({
+      to: "/projects/$project/screenplays/$screenplayId",
+      params: { project, screenplayId },
+    });
 
   const [createOpen, setCreateOpen] = useState(false);
   const [newTitle, setNewTitle] = useState("");
@@ -41,6 +54,13 @@ function ScreenplaysPage() {
   const [deleteTarget, setDeleteTarget] = useState<ScreenplaySummary | null>(null);
 
   const items = response?.data ?? [];
+
+  // 编辑器($screenplayId)是本路由的子路由:TanStack 只有经父组件的 <Outlet/> 才会挂载子路由,
+  // 否则子路由永远不渲染且无报错。进入编辑 URL 时整页让位给编辑器(与 episodes 页面同一模式)。
+  const routeParams = useParams({ strict: false });
+  if (routeParams.screenplayId) {
+    return <Outlet />;
+  }
 
   const handleCreate = async () => {
     if (!newTitle.trim()) return;
@@ -53,7 +73,7 @@ function ScreenplaysPage() {
       setCreateOpen(false);
       setNewTitle("");
       setNewSynopsis("");
-      await Route.navigate({
+      await navigate({
         to: "/projects/$project/screenplays/$screenplayId",
         params: { project, screenplayId: document.id },
       });
@@ -83,6 +103,9 @@ function ScreenplaysPage() {
           <p className="mt-1 text-sm text-muted-foreground">
             {t("screenplays.subtitle")}
           </p>
+          <p className="mt-0.5 text-xs text-muted-foreground/70">
+            {t("screenplays.cardHint")}
+          </p>
         </div>
         <Button onClick={() => setCreateOpen(true)} size="sm">
           <Plus className="mr-1 size-4" />
@@ -96,7 +119,7 @@ function ScreenplaysPage() {
           {t("screenplays.loading")}
         </div>
       ) : items.length === 0 ? (
-        <div className="flex flex-col items-center gap-3 rounded-[12px] border border-dashed border-white/10 py-16 text-center">
+        <div className="flex flex-col items-center gap-3 rounded-[12px] border border-dashed border-border py-16 text-center">
           <FileText className="size-8 text-muted-foreground/50" />
           <p className="text-sm text-muted-foreground">{t("screenplays.empty")}</p>
           <Button variant="outline" size="sm" onClick={() => setCreateOpen(true)}>
@@ -110,44 +133,55 @@ function ScreenplaysPage() {
             <div
               key={item.id}
               className={cn(
-                "group relative rounded-[12px] border border-white/10 bg-white/[0.025] p-4",
-                "transition-colors hover:border-white/20 hover:bg-white/[0.04]",
+                "group relative cursor-default select-none rounded-[12px] border border-border bg-card p-4",
+                "transition-colors hover:border-ring/40 hover:bg-accent/40",
               )}
+              onDoubleClick={() => openEditor(item.id)}
             >
-              <Link
-                to="/projects/$project/screenplays/$screenplayId"
-                params={{ project, screenplayId: item.id }}
-                className="block"
-              >
-                <div className="flex items-center gap-2">
-                  <FileText className="size-4 shrink-0 text-muted-foreground" />
-                  <span className="truncate text-sm font-semibold text-foreground">
-                    {item.title}
+              <div className="flex items-center gap-2 pr-14">
+                <FileText className="size-4 shrink-0 text-muted-foreground" />
+                <Link
+                  to="/projects/$project/screenplays/$screenplayId"
+                  params={{ project, screenplayId: item.id }}
+                  className="truncate text-sm font-semibold text-foreground transition-colors hover:text-primary hover:underline"
+                >
+                  {item.title}
+                </Link>
+                {item.status === "final" && (
+                  <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600">
+                    {t("screenplays.statusFinal")}
                   </span>
-                  {item.status === "final" && (
-                    <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
-                      {t("screenplays.statusFinal")}
-                    </span>
-                  )}
-                </div>
-                {item.synopsis && (
-                  <p className="mt-2 line-clamp-2 text-xs leading-relaxed text-muted-foreground">
-                    {item.synopsis}
-                  </p>
                 )}
-                <div className="mt-3 flex items-center gap-3 text-[11px] text-muted-foreground/70">
-                  <span>{t("screenplays.charCount", { count: item.char_count })}</span>
-                  <span>{item.updated_at.slice(0, 16).replace("T", " ")}</span>
-                </div>
-              </Link>
-              <button
-                type="button"
-                aria-label={t("screenplays.delete")}
-                onClick={() => setDeleteTarget(item)}
-                className="absolute right-3 top-3 rounded p-1 text-muted-foreground/50 opacity-0 transition-opacity hover:bg-red-500/10 hover:text-red-400 focus-visible:opacity-100 group-hover:opacity-100"
-              >
-                <Trash2 className="size-3.5" />
-              </button>
+              </div>
+              {item.synopsis && (
+                <p className="mt-2 line-clamp-2 text-xs leading-relaxed text-muted-foreground">
+                  {item.synopsis}
+                </p>
+              )}
+              <div className="mt-3 flex items-center gap-3 text-[11px] text-muted-foreground/70">
+                <span>{t("screenplays.charCount", { count: item.char_count })}</span>
+                <span>{item.updated_at.slice(0, 16).replace("T", " ")}</span>
+              </div>
+              <div className="absolute right-3 top-3 flex items-center gap-1">
+                <button
+                  type="button"
+                  aria-label={t("screenplays.edit")}
+                  title={t("screenplays.edit")}
+                  onClick={() => openEditor(item.id)}
+                  className="rounded p-1 text-muted-foreground/70 transition-colors hover:bg-primary/10 hover:text-primary"
+                >
+                  <Pencil className="size-3.5" />
+                </button>
+                <button
+                  type="button"
+                  aria-label={t("screenplays.delete")}
+                  title={t("screenplays.delete")}
+                  onClick={() => setDeleteTarget(item)}
+                  className="rounded p-1 text-muted-foreground/70 transition-colors hover:bg-red-500/10 hover:text-red-500"
+                >
+                  <Trash2 className="size-3.5" />
+                </button>
+              </div>
             </div>
           ))}
         </div>

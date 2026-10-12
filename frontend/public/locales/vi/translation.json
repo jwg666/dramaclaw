@@ -8438,6 +8438,8 @@
     "deleteSuccess": "Đã xóa kịch bản",
     "deleteFailed": "Xóa kịch bản thất bại",
     "statusFinal": "Hoàn thiện",
+    "edit": "Chỉnh sửa",
+    "cardHint": "Nhấn đúp vào thẻ để chỉnh sửa, hoặc dùng nút chỉnh sửa trên thẻ",
     "back": "Về danh sách",
     "save": "Lưu",
     "saved": "Đã lưu",

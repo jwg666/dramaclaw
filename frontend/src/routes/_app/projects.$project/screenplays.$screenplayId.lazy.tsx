@@ -35,7 +35,7 @@ import {
 } from "@/components/ui/dialog";
 // 与列表页同款输入框样式（各自持有常量，避免 lazy chunk 反向依赖非 lazy 路由模块）。
 const EDITOR_INPUT_CLASS =
-  "h-9 rounded-[8px] border-white/10 bg-white/[0.025] px-3 text-sm shadow-none placeholder:text-muted-foreground/60 focus-visible:border-white/20 focus-visible:ring-2 focus-visible:ring-white/8 dark:bg-white/[0.025]";
+  "h-9 rounded-[8px] border border-border bg-card px-3 text-sm shadow-none placeholder:text-muted-foreground/60 focus-visible:border-ring/50 focus-visible:ring-2 focus-visible:ring-ring/20";
 
 // 场次头约定（与后端 screenplay_normalizer / format check 同一约定）：
 // 「第N场 地点 时间」，N 支持汉字数字。仅用于统计展示，不做硬校验。
@@ -117,7 +117,7 @@ function ScreenplayEditorPage() {
       } catch (error) {
         setSaveState("idle");
         toast.error(
-          backendErrorToastMessage(error, t("screenplays.saveFailed")),
+          backendErrorToastMessage(error, t),
         );
       }
     }, 1500);
@@ -158,7 +158,7 @@ function ScreenplayEditorPage() {
         usedSelection: result.used_selection,
       });
     } catch (error) {
-      toast.error(backendErrorToastMessage(error, t("screenplays.ai.failed")));
+      toast.error(backendErrorToastMessage(error, t));
     }
   };
 
@@ -194,7 +194,7 @@ function ScreenplayEditorPage() {
       toast.success(t("screenplays.saved"));
     } catch (error) {
       setSaveState("idle");
-      toast.error(backendErrorToastMessage(error, t("screenplays.saveFailed")));
+      toast.error(backendErrorToastMessage(error, t));
     }
   };
 
@@ -204,7 +204,7 @@ function ScreenplayEditorPage() {
       setExportResult(result);
       setExportDialog(true);
     } catch (error) {
-      toast.error(backendErrorToastMessage(error, t("screenplays.exportFailed")));
+      toast.error(backendErrorToastMessage(error, t));
     }
   };
 
@@ -222,7 +222,7 @@ function ScreenplayEditorPage() {
         params: { project },
       });
     } catch (error) {
-      toast.error(backendErrorToastMessage(error, t("screenplays.exportStartFailed")));
+      toast.error(backendErrorToastMessage(error, t));
     }
   };
 
@@ -345,7 +345,7 @@ function ScreenplayEditorPage() {
         onMouseUp={captureSelection}
         placeholder={t("screenplays.contentPlaceholder")}
         spellCheck={false}
-        className="min-h-[560px] w-full resize-y rounded-[12px] border border-white/10 bg-white/[0.02] p-4 font-mono text-sm leading-relaxed shadow-none placeholder:text-muted-foreground/50 focus-visible:border-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/8"
+        className="min-h-[560px] w-full resize-y rounded-[12px] border border-border bg-card p-4 font-mono text-sm leading-relaxed shadow-none placeholder:text-muted-foreground/50 focus-visible:border-ring/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/20"
       />
 
       {/* AI 结果 */}
@@ -365,7 +365,7 @@ function ScreenplayEditorPage() {
           <textarea
             readOnly
             value={aiDialog?.text ?? ""}
-            className="min-h-64 w-full resize-y rounded-[8px] border border-white/10 bg-white/[0.02] p-3 font-mono text-sm leading-relaxed"
+            className="min-h-64 w-full resize-y rounded-[8px] border border-border bg-muted/40 p-3 font-mono text-sm leading-relaxed"
           />
           <DialogFooter>
             <Button variant="ghost" size="sm" onClick={() => setAiDialog(null)}>
@@ -396,7 +396,7 @@ function ScreenplayEditorPage() {
               </p>
               {exportResult.format_check &&
                 exportResult.format_check.level !== "ok" && (
-                  <p className="rounded-[8px] border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-300">
+                  <p className="rounded-[8px] border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700">
                     {exportResult.format_check.summary}
                   </p>
                 )}
