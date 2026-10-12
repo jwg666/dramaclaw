@@ -1847,7 +1847,7 @@ button:hover .st-keyframe-video-play {
      MotionConfig / JS libraries opt-in via matchMedia; this rule covers
      CSS keyframes (tw-animate-css, animate-spin, custom transitions) that
      libraries cannot suppress on their own. */
-  @media (prefers-reduced-motion: reduce) {
+    @media (prefers-reduced-motion: reduce) {
 
     *,
     *::before,
@@ -1859,4 +1859,44 @@ button:hover .st-keyframe-video-play {
     }
   }
 
+}
+
+/* ═══════════════════════════════════════════════════════════
+   浅色模式兜底映射(默认主题已切为 light)。
+   存量页面大量使用暗色优先的 white-alpha 工具类
+   (border-white/10、bg-white/[0.025]、hover:bg-white/… 等约 1900 处),
+   在白底下会"隐形"。这里在 .light 作用域内把它们整体映射到亮色等价物,
+   一处规则修全站。新代码请直接用语义 token(border/bg-card/accent),
+   不要再新增 white-alpha 类。规则放在 @layer 之外,确保覆盖 utilities。
+   ═══════════════════════════════════════════════════════════ */
+.light [class*=" border-white/"],
+.light [class^="border-white/"] {
+  border-color: var(--ui-border-soft);
+}
+
+.light [class*=" hover:border-white/"]:hover,
+.light [class^="hover:border-white/"]:hover {
+  border-color: var(--ui-border-strong);
+}
+
+.light [class*=" bg-white/["],
+.light [class^="bg-white/["],
+.light .bg-white\/5,
+.light .bg-white\/10 {
+  background-color: rgba(15, 23, 42, 0.03);
+}
+
+.light [class*=" hover:bg-white/["]:hover,
+.light [class^="hover:bg-white/["]:hover,
+.light .hover\:bg-white\/5:hover,
+.light .hover\:bg-white\/10:hover {
+  background-color: rgba(15, 23, 42, 0.05);
+}
+
+.light [class*="ring-white/"] {
+  --tw-ring-color: rgba(15, 23, 42, 0.16);
+}
+
+.light [class*="divide-white/"] > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--ui-border-soft);
 }

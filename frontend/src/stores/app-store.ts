@@ -124,7 +124,7 @@ export const useAppStore = create<AppState>()(
   persist(
     (set) => ({
       language: "zh",
-      theme: "dark",
+      theme: "light",
       dashboardTab: "active",
       dashboardView: "card",
       aiAssistantOpen: false,
