@@ -97,6 +97,8 @@ docker run --rm -v dramaclaw-ce_newapi-data:/data -v "$PWD":/backup alpine \
   tar czf /backup/newapi-data.tgz -C /data .
 ```
 
+> If you configured `NOVELVIDEO_DB_DSN` to move application storage to MySQL, relational data no longer grows inside the `ce-data` volume — back it up with `mysqldump` instead (still snapshot the `mysql-data` volume), while the gateway database (`newapi-data`) keeps the backup method above.
+
 Restore it the same way, into the target volume:
 
 ```bash

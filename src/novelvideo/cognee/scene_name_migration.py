@@ -10,6 +10,7 @@ import aiosqlite
 from pydantic import BaseModel, Field
 
 from novelvideo.cognee.screenplay_normalizer import clean_scene_name_and_time
+from novelvideo.db.sql_compat import table_columns_async, tx, utc_datetime_str
 
 
 class SceneNameMigrationReport(BaseModel):
@@ -87,15 +88,10 @@ async def migrate_scene_names(
     report.backup_path = str(_backup_database(db_path))
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
-        await db.execute("BEGIN")
-        try:
+        async with tx(db):
             for group in groups:
                 await _apply_scene_group(db, group)
             await _apply_beat_updates(db, migrations)
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            raise
     return report
 
 
@@ -117,10 +113,7 @@ async def _schema_is_valid(
 
 
 async def _table_columns(db: aiosqlite.Connection, table_name: str) -> set[str]:
-    cursor = await db.execute(f"PRAGMA table_info({table_name})")
-    rows = await cursor.fetchall()
-    await cursor.close()
-    return {row[1] for row in rows}
+    return set(await table_columns_async(db, table_name))
 
 
 async def _load_scenes(
@@ -433,7 +426,7 @@ async def _apply_scene_rename(
             spatial_layout_image = ?,
             notes = ?,
             scene_type = ?,
-            updated_at = datetime('now')
+            updated_at = ?
         WHERE name = ?
         """,
         (
@@ -444,6 +437,7 @@ async def _apply_scene_rename(
             final_scene.get("spatial_layout_image", ""),
             final_scene.get("notes", ""),
             final_scene.get("scene_type", ""),
+            utc_datetime_str(),
             old,
         ),
     )
@@ -463,7 +457,7 @@ async def _apply_scene_update(
             spatial_layout_image = ?,
             notes = ?,
             scene_type = ?,
-            updated_at = datetime('now')
+            updated_at = ?
         WHERE name = ?
         """,
         (
@@ -473,6 +467,7 @@ async def _apply_scene_update(
             final_scene.get("spatial_layout_image", ""),
             final_scene.get("notes", ""),
             final_scene.get("scene_type", ""),
+            utc_datetime_str(),
             canonical,
         ),
     )
@@ -512,11 +507,12 @@ async def _apply_beat_updates(
             await db.execute(
                 """
                 UPDATE beats
-                SET scene_ref_json = ?, updated_at = datetime('now')
+                SET scene_ref_json = ?, updated_at = ?
                 WHERE episode_number = ? AND beat_number = ?
                 """,
                 (
                     json.dumps(scene_ref, ensure_ascii=False),
+                    utc_datetime_str(),
                     row["episode_number"],
                     row["beat_number"],
                 ),

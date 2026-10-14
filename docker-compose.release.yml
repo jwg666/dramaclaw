@@ -34,8 +34,10 @@ services:
       NEWAPI_BASE_URL: "${NEWAPI_BASE_URL:-https://relayclaw.cdnfg.com/v1}"
       # 以下四项只给 provisioner 用（用户切到「自定义 / 本地 + 官方混合」时一键初始化内置网关），
       # 由 compose 强制覆盖 .env 里的 127.0.0.1 地址（进容器是错的）。
+      # 网关库切到 MySQL 时（DRAMACLAW_GATEWAY_MYSQL_DSN），provisioner 必须指向同一 DSN：
+      # .env 同时设 NEWAPI_SQL_DSN=mysql://…（pymysql 直连网关库）。
       NEWAPI_ADMIN_BASE_URL: http://newapi:3000
-      NEWAPI_SQL_DSN: local
+      NEWAPI_SQL_DSN: "${NEWAPI_SQL_DSN:-local}"
       NEWAPI_SQLITE_PATH: /newapi-data/one-api.db
       NEWAPI_ADMIN_USERNAME: root
       # 默认开；用户在同目录 .env 里写 NEWAPI_PROVISIONER_ENABLED=false 即可关（compose 插值读 .env）。
@@ -60,7 +62,10 @@ services:
     environment:
       TZ: Asia/Shanghai
       # 留空 = 内置 SQLite（容器内 /data/one-api.db），与 api 侧 /newapi-data/one-api.db 是同一文件。
-      SQL_DSN: ""
+      # 切网关到 MySQL:.env 设 DRAMACLAW_GATEWAY_MYSQL_DSN=root:<密码>@tcp(mysql:3306)/dramaclaw_gateway
+      # (one-api 原生支持 MySQL,需先 --profile mysql 起库;网关库为独立 database,历史数据不迁移、
+      #  经 provisioner 重新初始化渠道与令牌)。
+      SQL_DSN: "${DRAMACLAW_GATEWAY_MYSQL_DSN:-}"
     # 默认只绑本机回环：网关的首启 setup 页在初始化前对任何能访问 3000 的人开放。
     # 需要从别的机器进网关后台时，.env 设 ST_NEWAPI_BIND=0.0.0.0。
     ports:
@@ -90,6 +95,35 @@ services:
     depends_on:
       - api
 
+  # 可选 MySQL 8 关系库(--profile mysql 启用;不启用时一切照旧走卷内 SQLite)。
+  # 启用步骤:
+  #   1. .env 配 NOVELVIDEO_DB_DSN=mysql://dramaclaw:<密码>@mysql:3306/dramaclaw?charset=utf8mb4
+  #      (密码特殊字符按 URL 规则百分号编码;账号/库名/密码用下面三个变量覆盖)
+  #   2. docker compose --profile mysql up -d
+  # 历史数据迁移:python scripts/migrate_sqlite_to_mysql.py(先起库再跑)。
+  mysql:
+    image: mysql:8.0
+    profiles: ["mysql"]
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: ${DRAMACLAW_MYSQL_ROOT_PASSWORD:-dramaclaw-root}
+      MYSQL_DATABASE: ${DRAMACLAW_MYSQL_DB:-dramaclaw}
+      MYSQL_USER: ${DRAMACLAW_MYSQL_USER:-dramaclaw}
+      MYSQL_PASSWORD: ${DRAMACLAW_MYSQL_PASSWORD:-dramaclaw}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
 volumes:
   ce-data:
   newapi-data:
+  mysql-data:

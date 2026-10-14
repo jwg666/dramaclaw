@@ -1,12 +1,10 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11, <3.13"
 resolution-markers = [
     "python_full_version >= '3.12'",
     "python_full_version < '3.12'",
 ]
-
-[manifest]
 
 [[manifest.dependency-metadata]]
 name = "da2"
@@ -96,6 +94,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/f1/23/b52debf471f7a1e42e362d959a3982bdcb4fe13a5d46e63d28868807a79c/aiolimiter-1.2.1.tar.gz", hash = "sha256:e02a37ea1a855d9e832252a105420ad4d15011505512a1a1d814647451b5cca9", size = 7185, upload-time = "2024-12-08T15:31:51.496Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/f3/ba/df6e8e1045aebc4778d19b8a3a9bc1808adb1619ba94ca354d9ba17d86c3/aiolimiter-1.2.1-py3-none-any.whl", hash = "sha256:d3f249e9059a20badcb56b61601a83556133655c11d1eb3dd3e04ff069e5f3c7", size = 6711, upload-time = "2024-12-08T15:31:49.874Z" },
+]
+
+[[package]]
+name = "aiomysql"
+version = "0.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pymysql" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/29/e0/302aeffe8d90853556f47f3106b89c16cc2ec2a4d269bdfd82e3f4ae12cc/aiomysql-0.3.2.tar.gz", hash = "sha256:72d15ef5cfc34c03468eb41e1b90adb9fd9347b0b589114bd23ead569a02ac1a", size = 108311, upload-time = "2025-10-22T00:15:21.278Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4c/af/aae0153c3e28712adaf462328f6c7a3c196a1c1c27b491de4377dd3e6b52/aiomysql-0.3.2-py3-none-any.whl", hash = "sha256:c82c5ba04137d7afd5c693a258bea8ead2aad77101668044143a991e04632eb2", size = 71834, upload-time = "2025-10-22T00:15:15.905Z" },
 ]
 
 [[package]]
@@ -3455,6 +3465,7 @@ name = "supertale-ce"
 version = "2.0.6"
 source = { editable = "." }
 dependencies = [
+    { name = "aiomysql" },
     { name = "aiosqlite" },
     { name = "asyncpg" },
     { name = "celery" },
@@ -3527,6 +3538,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiomysql" },
     { name = "aiosqlite", specifier = ">=0.19.0" },
     { name = "asyncpg", specifier = ">=0.30.0" },
     { name = "celery", specifier = ">=5.4.0" },

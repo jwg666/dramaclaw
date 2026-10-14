@@ -14,6 +14,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from novelvideo.db.sql_compat import immediate_tx_sync, table_columns_sync, upsert_sql
 from novelvideo.freezone.paths import CANVAS_ID_RE
 from novelvideo.i18n_message import lmsg, message_payload
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
@@ -79,10 +80,7 @@ def _connect(project_dir: Path):
             if db_path not in _SCHEMA_READY_PATHS:
                 configure_sqlite_connection(conn)
                 conn.executescript(WORKFLOW_DRAFT_SCHEMA_SQL)
-                columns = {
-                    str(row[1])
-                    for row in conn.execute("PRAGMA table_info(workflow_drafts)")
-                }
+                columns = set(table_columns_sync(conn, "workflow_drafts"))
                 if "task_id" not in columns:
                     conn.execute(
                         "ALTER TABLE workflow_drafts ADD COLUMN task_id TEXT NOT NULL DEFAULT ''"
@@ -276,32 +274,36 @@ def _read_draft(
 
 def _write_draft(conn: sqlite3.Connection, payload: dict[str, Any]) -> None:
     conn.execute(
-        """
-        INSERT INTO workflow_drafts (
-            draft_id, schema_version, project_id, canvas_id, revision, status,
-            skill_id, run_after_create, intent_json, compiled_json, preview_json,
-            last_changes_json, operation_id, task_id, root_task_id,
-            plan_digest, created_at, updated_at, expires_at,
-            confirmation_started_at, confirmed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(draft_id) DO UPDATE SET
-            revision = excluded.revision,
-            status = excluded.status,
-            skill_id = excluded.skill_id,
-            run_after_create = excluded.run_after_create,
-            intent_json = excluded.intent_json,
-            compiled_json = excluded.compiled_json,
-            preview_json = excluded.preview_json,
-            last_changes_json = excluded.last_changes_json,
-            operation_id = excluded.operation_id,
-            task_id = excluded.task_id,
-            root_task_id = excluded.root_task_id,
-            plan_digest = excluded.plan_digest,
-            updated_at = excluded.updated_at,
-            expires_at = excluded.expires_at,
-            confirmation_started_at = excluded.confirmation_started_at,
-            confirmed_at = excluded.confirmed_at
-        """,
+        upsert_sql(
+            "workflow_drafts",
+            ("draft_id",),
+            (
+                "draft_id", "schema_version", "project_id", "canvas_id",
+                "revision", "status", "skill_id", "run_after_create",
+                "intent_json", "compiled_json", "preview_json",
+                "last_changes_json", "operation_id", "task_id", "root_task_id",
+                "plan_digest", "created_at", "updated_at", "expires_at",
+                "confirmation_started_at", "confirmed_at",
+            ),
+            set_sql=(
+                "revision = excluded.revision, "
+                "status = excluded.status, "
+                "skill_id = excluded.skill_id, "
+                "run_after_create = excluded.run_after_create, "
+                "intent_json = excluded.intent_json, "
+                "compiled_json = excluded.compiled_json, "
+                "preview_json = excluded.preview_json, "
+                "last_changes_json = excluded.last_changes_json, "
+                "operation_id = excluded.operation_id, "
+                "task_id = excluded.task_id, "
+                "root_task_id = excluded.root_task_id, "
+                "plan_digest = excluded.plan_digest, "
+                "updated_at = excluded.updated_at, "
+                "expires_at = excluded.expires_at, "
+                "confirmation_started_at = excluded.confirmation_started_at, "
+                "confirmed_at = excluded.confirmed_at"
+            ),
+        ),
         (
             payload["draft_id"],
             payload["schema_version"],
@@ -382,8 +384,9 @@ def create_workflow_draft(
         "confirmation_started_at": None,
         "confirmed_at": None,
     }
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_drafts:{canvas_id}"
+    ):
         _write_draft(conn, payload)
     return deepcopy(payload)
 
@@ -424,8 +427,9 @@ def patch_workflow_draft(
         return None, _unavailable("workflow draft intent must be an object")
     if not isinstance(compiled, dict) or not compiled.get("ok"):
         return None, _unavailable("workflow draft compiled plan is invalid")
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_drafts:{canvas_id}"
+    ):
         payload = _read_draft(conn, canvas_id=canvas_id, draft_id=draft_id)
         if payload is None:
             return None, _unavailable("workflow draft not found")
@@ -488,8 +492,9 @@ def cancel_workflow_draft(
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Cancel an unconfirmed draft atomically so a stale confirmation cannot claim it."""
     _validate_scope(canvas_id, draft_id)
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_drafts:{canvas_id}"
+    ):
         payload = _read_draft(conn, canvas_id=canvas_id, draft_id=draft_id)
         if payload is None:
             return None, _unavailable("workflow draft not found")
@@ -525,8 +530,9 @@ def claim_workflow_draft_confirmation(
     now: float | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     _validate_scope(canvas_id, draft_id)
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_drafts:{canvas_id}"
+    ):
         payload = _read_draft(conn, canvas_id=canvas_id, draft_id=draft_id)
         if payload is None:
             return None, _unavailable("workflow draft not found")
@@ -600,8 +606,9 @@ def bind_workflow_draft_task(
     clean_root_task_id = str(root_task_id or "").strip()
     if not clean_task_id or not clean_root_task_id:
         raise ValueError("workflow confirmation task identity is required")
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_drafts:{canvas_id}"
+    ):
         payload = _read_draft(conn, canvas_id=canvas_id, draft_id=draft_id)
         if payload is None:
             return None
@@ -633,8 +640,9 @@ def finish_workflow_draft_confirmation(
     _validate_scope(canvas_id, draft_id)
     if outcome not in CONFIRMATION_OUTCOMES:
         raise ValueError(f"unsupported workflow draft confirmation outcome: {outcome}")
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_drafts:{canvas_id}"
+    ):
         payload = _read_draft(conn, canvas_id=canvas_id, draft_id=draft_id)
         if payload is None:
             return None
@@ -682,8 +690,9 @@ def prune_expired_workflow_drafts(
 ) -> int:
     if canvas_id is not None:
         _validate_scope(canvas_id)
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_drafts:{canvas_id or ''}"
+    ):
         cutoff = time.time() if now is None else float(now)
         query = "SELECT * FROM workflow_drafts WHERE expires_at < ?"
         params: tuple[Any, ...] = (cutoff,)

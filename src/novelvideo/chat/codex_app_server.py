@@ -21,6 +21,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from novelvideo.db.adapter import acquire_sync
+from novelvideo.db.dsn import scope_identity
+from novelvideo.db.sql_compat import is_mysql, rowid_expr, table_columns_sync
+
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _MAX_MESSAGE_BYTES = 128 << 20
 _NODE_ENV_ALLOWLIST = {
@@ -153,25 +157,33 @@ def _sanitize_legacy_turn_metadata(codex_home: Path) -> int:
     still needed because CODEX_HOME is persistent and may predate the patch.
     ``secure_delete`` plus ``VACUUM`` removes superseded SQLite page contents;
     truncating WAL removes the second copy.
+
+    MySQL: the redaction targets the Codex runtime's own ``logs_2.sqlite``
+    file, but the runtime writes that file directly and never reads a
+    DramaClaw scope, so a scope-bound MySQL connection finds no ``logs`` table
+    and the scan degrades to a no-op (the legacy file, if any, is left for the
+    next SQLite-backend run).
     """
 
     database = codex_home / "logs_2.sqlite"
     if not database.is_file():
         return 0
-    connection = sqlite3.connect(database, timeout=10)
+    if is_mysql():
+        connection = acquire_sync(scope_identity(database)[0])
+    else:
+        connection = sqlite3.connect(database, timeout=10)
     changed = 0
     try:
-        connection.execute("PRAGMA secure_delete=ON")
-        table = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='logs'"
-        ).fetchone()
-        if table is None:
-            return 0
-        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(logs)")}
+        if not is_mysql():
+            connection.execute("PRAGMA secure_delete=ON")
+        # Portable existence + shape probe: column introspection yields rows
+        # only when the table exists, and the redaction needs its columns anyway.
+        columns = table_columns_sync(connection, "logs")
         if "feedback_log_body" not in columns:
             return 0
+        rowid = rowid_expr("logs")
         for row_id, body in connection.execute(
-            "SELECT rowid, feedback_log_body FROM logs"
+            f"SELECT {rowid}, feedback_log_body FROM logs"
         ).fetchall():
             if not isinstance(body, str):
                 continue
@@ -179,12 +191,12 @@ def _sanitize_legacy_turn_metadata(codex_home: Path) -> int:
             if redacted == body:
                 continue
             connection.execute(
-                "UPDATE logs SET feedback_log_body=? WHERE rowid=?",
+                f"UPDATE logs SET feedback_log_body=? WHERE {rowid}=?",
                 (redacted, row_id),
             )
             changed += 1
         connection.commit()
-        if changed:
+        if changed and not is_mysql():
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("VACUUM")
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")

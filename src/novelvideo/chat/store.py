@@ -22,9 +22,89 @@ from typing import Any, Literal
 
 import aiosqlite
 
+from novelvideo.db.adapter import acquire_async, acquire_sync
+from novelvideo.db.dsn import scope_identity
+from novelvideo.db.schema_runner import ensure_mysql_schema
+from novelvideo.db.sql_compat import (
+    BACKEND_MYSQL,
+    active_backend,
+    immediate_tx,
+    insert_ignore_sql,
+    is_busy_error,
+    is_mysql,
+    table_columns_async,
+    table_columns_sync,
+    table_exists_async,
+)
 from novelvideo.sqlite_pragmas import (
     configure_sqlite_connection,
     configure_sqlite_connection_async,
+)
+
+# ---------------------------------------------------------------------------
+# Canonical chat.db schema, shared by every per-scope chat database and by
+# message_repository.connect (the legacy project chat DB targets the same
+# file, so both modules must agree on one DDL — see below).
+# ---------------------------------------------------------------------------
+
+CHAT_DB_SCHEMA_COMPONENT = "chat_store"
+CHAT_DB_SCHEMA_VERSION = 1
+
+# SQLite initializers run TABLES first, then the ad-hoc column upgrades,
+# then INDEXES (a legacy database gains its columns before its indexes).
+# MySQL consumes TABLES + INDEXES as one script: ensure_mysql_schema runs
+# DDL before column upgrades, and the index-column collector must see the
+# indexes in the same script as their tables.
+CHAT_DB_TABLES_SQL = """
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  media_json TEXT NOT NULL DEFAULT '[]',
+  turn_id TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  idempotency_key TEXT,
+  created_at TEXT NOT NULL
+)
+"""
+CHAT_DB_INDEXES_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_messages_idempotency_key
+  ON chat_messages(idempotency_key)
+ WHERE idempotency_key IS NOT NULL AND idempotency_key <> ''
+"""
+CHAT_DB_SCHEMA_SQL = "\n;\n".join(
+    (
+        CHAT_DB_TABLES_SQL.strip(),
+        CHAT_DB_INDEXES_SQL.strip(),
+        """
+        CREATE TABLE IF NOT EXISTS chat_ui_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          turn_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+        """.strip(),
+        """
+        CREATE INDEX IF NOT EXISTS idx_chat_ui_events_turn_id
+          ON chat_ui_events(turn_id, id)
+        """.strip(),
+        """
+        CREATE TABLE IF NOT EXISTS chat_settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+        """.strip(),
+    )
+)
+
+# (table, column, SQLite definition) — the ad-hoc ALTER upgrades applied to
+# pre-turn-id legacy chat databases.
+CHAT_DB_COLUMN_UPGRADES = (
+    ("chat_messages", "turn_id", "TEXT"),
+    ("chat_messages", "metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ("chat_messages", "idempotency_key", "TEXT"),
 )
 
 
@@ -60,6 +140,17 @@ def _strip_replayed_assistant_prefix(content: str, previous_assistant: object) -
     return text
 
 
+_CHAT_MESSAGE_COLS = (
+    "role",
+    "content",
+    "media_json",
+    "turn_id",
+    "metadata_json",
+    "idempotency_key",
+    "created_at",
+)
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
@@ -69,6 +160,54 @@ def _state_root() -> Path:
     if configured:
         return Path(configured).expanduser()
     return _repo_root() / "state"
+
+
+async def _open_chat_db(db_path: Path):
+    """Open one chat.db connection on the active storage backend.
+
+    MySQL: ensure the chat scope schema (idempotent, process-cached) and
+    return a pooled connection bound to the chat.db scope — per-connection
+    initialization is unnecessary because the schema is already current.
+    SQLite: create the parent directory and return a fresh aiosqlite
+    connection (the caller initializes its schema).
+    """
+
+    if active_backend() == BACKEND_MYSQL:
+        key, relpath = scope_identity(db_path)
+        await asyncio.to_thread(
+            ensure_mysql_schema,
+            key,
+            component=CHAT_DB_SCHEMA_COMPONENT,
+            version=CHAT_DB_SCHEMA_VERSION,
+            ddl_scripts=[CHAT_DB_SCHEMA_SQL],
+            column_upgrades=CHAT_DB_COLUMN_UPGRADES,
+            relpath=relpath,
+        )
+        return await acquire_async(key)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db = await aiosqlite.connect(db_path, timeout=10)
+    db.row_factory = aiosqlite.Row
+    return db
+
+
+def _open_chat_db_sync(db_path: Path):
+    """Sync counterpart of :func:`_open_chat_db` (sqlite3 / pooled MySQL)."""
+
+    if active_backend() == BACKEND_MYSQL:
+        key, relpath = scope_identity(db_path)
+        ensure_mysql_schema(
+            key,
+            component=CHAT_DB_SCHEMA_COMPONENT,
+            version=CHAT_DB_SCHEMA_VERSION,
+            ddl_scripts=[CHAT_DB_SCHEMA_SQL],
+            column_upgrades=CHAT_DB_COLUMN_UPGRADES,
+            relpath=relpath,
+        )
+        return acquire_sync(key)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 @dataclass(frozen=True)
@@ -191,18 +330,15 @@ class ChatStore:
     async def clear_messages_async(self, username: str, scope: ChatScope) -> int:
         """Clear only one chat scope, preserving its settings and other project data."""
         db_path = self.read_db_for(username, scope)
-        if not db_path.exists():
+        if not is_mysql() and not db_path.exists():
             return 0
         db = await self.connect_async(username, scope, db_path=db_path)
         try:
-            await db.execute("BEGIN IMMEDIATE")
-            cursor = await db.execute("DELETE FROM chat_messages")
-            await db.execute("DELETE FROM chat_ui_events")
-            await db.commit()
-            return max(cursor.rowcount, 0)
-        except BaseException:
-            await db.rollback()
-            raise
+            # lock 仅 MySQL 侧使用(GET_LOCK 串行化);SQLite 路径忽略该参数。
+            async with immediate_tx(db, lock="chat_messages:clear"):
+                cursor = await db.execute("DELETE FROM chat_messages")
+                await db.execute("DELETE FROM chat_ui_events")
+                return max(cursor.rowcount, 0)
         finally:
             await db.close()
 
@@ -255,16 +391,11 @@ class ChatStore:
     def _freezone_agent_summary_from_db(self, agent_id: str, db_path: Path) -> dict[str, Any] | None:
         if not db_path.exists():
             return None
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
+        conn = _open_chat_db_sync(db_path)
         try:
-            tables = {
-                str(row["name"])
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-            if "chat_messages" not in tables:
+            # Portable existence probe: column introspection yields rows only
+            # when the table exists (sqlite PRAGMA / information_schema alike).
+            if not table_columns_sync(conn, "chat_messages"):
                 return None
             latest = conn.execute(
                 """
@@ -358,13 +489,9 @@ class ChatStore:
     ) -> dict[str, Any] | None:
         if not db_path.exists():
             return None
-        db = await aiosqlite.connect(db_path, timeout=10)
-        db.row_factory = aiosqlite.Row
+        db = await _open_chat_db(db_path)
         try:
-            cursor = await db.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='chat_messages'"
-            )
-            if await cursor.fetchone() is None:
+            if not await table_exists_async(db, "chat_messages"):
                 return None
             cursor = await db.execute(
                 """
@@ -473,41 +600,19 @@ class ChatStore:
 
     def connect(self, username: str, scope: ChatScope, *, db_path: Path | None = None) -> sqlite3.Connection:
         db_path = db_path or self.db_for(username, scope)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
+        if active_backend() == BACKEND_MYSQL:
+            return _open_chat_db_sync(db_path)
+        conn = _open_chat_db_sync(db_path)
         configure_sqlite_connection(conn)
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chat_messages (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              role TEXT NOT NULL,
-              content TEXT NOT NULL,
-              media_json TEXT NOT NULL DEFAULT '[]',
-              turn_id TEXT,
-              metadata_json TEXT NOT NULL DEFAULT '{}',
-              idempotency_key TEXT,
-              created_at TEXT NOT NULL
-            )
-            """
-        )
-        columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()
-        }
+        conn.execute(CHAT_DB_TABLES_SQL)
+        columns = set(table_columns_sync(conn, "chat_messages"))
         if "turn_id" not in columns:
             conn.execute("ALTER TABLE chat_messages ADD COLUMN turn_id TEXT")
         if "metadata_json" not in columns:
             conn.execute("ALTER TABLE chat_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
         if "idempotency_key" not in columns:
             conn.execute("ALTER TABLE chat_messages ADD COLUMN idempotency_key TEXT")
-        conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_messages_idempotency_key
-              ON chat_messages(idempotency_key)
-             WHERE idempotency_key IS NOT NULL AND idempotency_key <> ''
-            """
-        )
+        conn.execute(CHAT_DB_INDEXES_SQL)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS chat_ui_events (
@@ -546,14 +651,14 @@ class ChatStore:
         _schema_attempt: int = 0,
     ) -> aiosqlite.Connection:
         resolved_path = db_path or self.db_for(username, scope)
-        resolved_path.parent.mkdir(parents=True, exist_ok=True)
-        db = await aiosqlite.connect(resolved_path, timeout=10)
-        db.row_factory = aiosqlite.Row
+        if active_backend() == BACKEND_MYSQL:
+            return await _open_chat_db(resolved_path)
+        db = await _open_chat_db(resolved_path)
         try:
             await self._initialize_connection_async(db)
         except sqlite3.OperationalError as exc:
             await db.close()
-            if "locked" not in str(exc).lower() or _schema_attempt >= 5:
+            if not is_busy_error(exc) or _schema_attempt >= 5:
                 raise
             await asyncio.sleep(0.05 * (_schema_attempt + 1))
             return await self.connect_async(
@@ -570,22 +675,8 @@ class ChatStore:
     @staticmethod
     async def _initialize_connection_async(db: aiosqlite.Connection) -> None:
         await configure_sqlite_connection_async(db)
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chat_messages (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              role TEXT NOT NULL,
-              content TEXT NOT NULL,
-              media_json TEXT NOT NULL DEFAULT '[]',
-              turn_id TEXT,
-              metadata_json TEXT NOT NULL DEFAULT '{}',
-              idempotency_key TEXT,
-              created_at TEXT NOT NULL
-            )
-            """
-        )
-        cursor = await db.execute("PRAGMA table_info(chat_messages)")
-        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        await db.execute(CHAT_DB_TABLES_SQL)
+        columns = set(await table_columns_async(db, "chat_messages"))
         if "turn_id" not in columns:
             await db.execute("ALTER TABLE chat_messages ADD COLUMN turn_id TEXT")
         if "metadata_json" not in columns:
@@ -594,13 +685,7 @@ class ChatStore:
             )
         if "idempotency_key" not in columns:
             await db.execute("ALTER TABLE chat_messages ADD COLUMN idempotency_key TEXT")
-        await db.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_messages_idempotency_key
-              ON chat_messages(idempotency_key)
-             WHERE idempotency_key IS NOT NULL AND idempotency_key <> ''
-            """
-        )
+        await db.execute(CHAT_DB_INDEXES_SQL)
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS chat_ui_events (
@@ -673,12 +758,7 @@ class ChatStore:
         conn = self.connect(username, scope)
         try:
             cursor = conn.execute(
-                """
-                INSERT OR IGNORE INTO chat_messages(
-                    role, content, media_json, turn_id, metadata_json,
-                    idempotency_key, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
+                insert_ignore_sql("chat_messages", _CHAT_MESSAGE_COLS),
                 (
                     role,
                     content,
@@ -762,12 +842,7 @@ class ChatStore:
         db = await self.connect_async(username, scope)
         try:
             cursor = await db.execute(
-                """
-                INSERT OR IGNORE INTO chat_messages(
-                    role, content, media_json, turn_id, metadata_json,
-                    idempotency_key, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
+                insert_ignore_sql("chat_messages", _CHAT_MESSAGE_COLS),
                 (
                     role,
                     content,

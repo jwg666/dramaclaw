@@ -40,6 +40,19 @@ from novelvideo.models import (
     normalize_detected_props,
     sync_beat_asset_refs,
 )
+from novelvideo.db.sql_compat import (
+    BACKEND_MYSQL,
+    active_backend,
+    insert_do_nothing_sql,
+    is_duplicate_column_error,
+    replace_into_sql,
+    table_columns_sync,
+    table_exists_async,
+    tx,
+    upsert_sql,
+    utc_datetime_str,
+    utc_iso_ms,
+)
 from novelvideo.novel_source import (
     load_imported_novel_content,
     require_imported_novel,
@@ -419,8 +432,7 @@ _PROJECT_STORE_SCHEMA_VERSION = 5
 
 
 def _table_columns(db: sqlite3.Connection, table: str) -> set[str]:
-    rows = db.execute(f"PRAGMA table_info({table})").fetchall()
-    return {str(row["name"]) for row in rows}
+    return {str(name) for name in table_columns_sync(db, table)}
 
 
 def _add_column_if_missing(
@@ -441,7 +453,7 @@ def _add_column_if_missing(
     try:
         db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
     except sqlite3.OperationalError as exc:
-        if "duplicate column name" not in str(exc).lower():
+        if not is_duplicate_column_error(exc):
             raise
         if name not in _table_columns(db, table):
             raise
@@ -455,6 +467,73 @@ def _leased(method):
             return await method(self, *args, **kwargs)
 
     return wrapper
+
+
+def project_store_column_upgrades() -> list[tuple[str, str, str]]:
+    """MySQL 侧与 _ensure_*_columns 等价的逐列升级清单(表, 列, SQLite定义)。"""
+
+    upgrades: list[tuple[str, str, str]] = []
+    for name, definition in {
+        "spatial_layout_image": "TEXT DEFAULT ''",
+        "base_scene_id": "TEXT DEFAULT ''",
+        "variant_id": "TEXT DEFAULT ''",
+        "time_of_day": "TEXT DEFAULT ''",
+        "variant_prompt": "TEXT DEFAULT ''",
+    }.items():
+        upgrades.append(("scenes", name, definition))
+    upgrades.append(("beats", "seedance2_config_json", "TEXT NOT NULL DEFAULT '{}'"))
+    for name, definition in {
+        "reference_audio_path": "TEXT DEFAULT ''",
+        "reference_audio_sha256": "TEXT DEFAULT ''",
+        "reference_audio_updated_at": "TEXT DEFAULT ''",
+        "voice_samples_by_age_group_json": "TEXT DEFAULT '{}'",
+    }.items():
+        upgrades.append(("characters", name, definition))
+    for name, definition in {
+        "beat_source_text": "TEXT DEFAULT ''",
+        "adapted_content": "TEXT DEFAULT ''",
+        "scene_menu_json": "TEXT DEFAULT '[]'",
+        "prop_menu_json": "TEXT DEFAULT '[]'",
+        "identity_default_map_json": "TEXT DEFAULT '{}'",
+    }.items():
+        upgrades.append(("episodes", name, definition))
+    for name, definition in {
+        "detected_identities_json": "TEXT DEFAULT '[]'",
+        "detected_props_json": "TEXT DEFAULT '[]'",
+        "scene_ref_json": "TEXT DEFAULT ''",
+        "audio_type": "TEXT DEFAULT 'narration'",
+        "speaker": "TEXT DEFAULT ''",
+        "speaker_kind": "TEXT DEFAULT 'character'",
+        "time_of_day": "TEXT DEFAULT ''",
+        "video_mode": "TEXT DEFAULT 'first_frame'",
+        "video_prompt": "TEXT DEFAULT ''",
+        "keyframe_prompt": "TEXT DEFAULT ''",
+        "shot_order": "INTEGER",
+        "duration_seconds": "REAL",
+        "is_manual_shot": "INTEGER DEFAULT 0",
+    }.items():
+        upgrades.append(("beats", name, definition))
+    return upgrades
+
+
+def ensure_project_store_mysql(db_path) -> None:
+    """在 MySQL 上确保项目库(data.db 逻辑库)schema 到当前版本。
+
+    SQLiteStore 与数据迁移工具共用:调用方负责处于 MySQL 后端。
+    """
+
+    from novelvideo.db.dsn import scope_identity
+    from novelvideo.db.schema_runner import ensure_mysql_schema
+
+    key, relpath = scope_identity(db_path)
+    ensure_mysql_schema(
+        key,
+        component=_PROJECT_STORE_SCHEMA_COMPONENT,
+        version=_PROJECT_STORE_SCHEMA_VERSION,
+        ddl_scripts=(SQLITE_SCHEMA_SQL, WORKFLOW_DRAFT_SCHEMA_SQL, WORKFLOW_RUN_SCHEMA_SQL),
+        column_upgrades=project_store_column_upgrades(),
+        relpath=relpath,
+    )
 
 
 def _auto_lease_public_async_methods(cls):
@@ -524,12 +603,19 @@ class SQLiteStore:
         self.state_dir = str(resolved_state_dir)
         self.db_path = str(resolved_state_dir / "data.db")
 
-    async def _ensure_db(self) -> aiosqlite.Connection:
+    async def _ensure_db(self):
         if self._closed or (self._closing and self._current_task_lease_depth() <= 0):
             raise StoreClosedError(self.project_dir)
         if self._db is None:
             if self._closing:
                 raise StoreClosedError(self.project_dir)
+            if active_backend() == BACKEND_MYSQL:
+                from novelvideo.db.adapter import acquire_async
+                from novelvideo.db.dsn import scope_key_for_path
+
+                await asyncio.to_thread(self._ensure_mysql_schema_sync)
+                self._db = await acquire_async(scope_key_for_path(self.db_path))
+                return self._db
             await self._ensure_project_schema()
             self._db = await aiosqlite.connect(self.db_path, timeout=10)
             self._db.row_factory = aiosqlite.Row
@@ -538,6 +624,16 @@ class SQLiteStore:
                 set_journal_mode=False,
             )
         return self._db
+
+    def _ensure_mysql_schema_sync(self) -> None:
+        """MySQL 后端的项目库 schema 迁移(to_thread 里跑)。"""
+
+        ensure_project_store_mysql(self.db_path)
+
+    def _project_column_upgrades(self) -> list[tuple[str, str, str]]:
+        """与 SQLite 侧 _ensure_*_columns 等价的逐列升级清单。"""
+
+        return project_store_column_upgrades()
 
     async def _ensure_project_schema(self) -> None:
         """Initialize/upgrade project tables once, serialized across processes."""
@@ -785,7 +881,8 @@ class SQLiteStore:
                 params.append(value)
         if not assignments:
             return await self.get_screenplay(screenplay_id)
-        assignments.append("updated_at = datetime('now')")
+        assignments.append("updated_at = ?")
+        params.append(utc_datetime_str())
         params.append(screenplay_id)
         db = await self._ensure_db()
         cursor = await db.execute(
@@ -809,10 +906,13 @@ class SQLiteStore:
     async def save_episode_content(self, ep_num: int, content: str) -> None:
         db = await self._ensure_db()
         await db.execute(
-            "INSERT INTO episodes (number, raw_content) VALUES (?, ?) "
-            "ON CONFLICT(number) DO UPDATE SET raw_content = excluded.raw_content, "
-            "updated_at = datetime('now')",
-            (ep_num, content),
+            upsert_sql(
+                "episodes",
+                ("number",),
+                ("number", "raw_content"),
+                touch_cols=("updated_at",),
+            ),
+            (ep_num, content, utc_datetime_str()),
         )
         await db.commit()
 
@@ -830,9 +930,9 @@ class SQLiteStore:
     async def save_adapted_content(self, ep_num: int, content: str) -> None:
         db = await self._ensure_db()
         cursor = await db.execute(
-            "UPDATE episodes SET adapted_content = ?, updated_at = datetime('now') "
+            "UPDATE episodes SET adapted_content = ?, updated_at = ? "
             "WHERE number = ?",
-            (content, ep_num),
+            (content, utc_datetime_str(), ep_num),
         )
         if cursor.rowcount == 0:
             raise ValueError(f"剧集 {ep_num} 不存在，无法保存改写稿")
@@ -883,8 +983,9 @@ class SQLiteStore:
     async def clear_episode_contents(self) -> int:
         db = await self._ensure_db()
         cursor = await db.execute(
-            "UPDATE episodes SET raw_content = '', updated_at = datetime('now') "
-            "WHERE raw_content != '' AND raw_content IS NOT NULL"
+            "UPDATE episodes SET raw_content = '', updated_at = ? "
+            "WHERE raw_content != '' AND raw_content IS NOT NULL",
+            (utc_datetime_str(),),
         )
         await db.commit()
         return cursor.rowcount
@@ -893,8 +994,8 @@ class SQLiteStore:
         try:
             db = await self._ensure_db()
             await db.execute(
-                f"UPDATE characters SET {field} = ?, updated_at = datetime('now') WHERE name = ?",
-                (value, name),
+                f"UPDATE characters SET {field} = ?, updated_at = ? WHERE name = ?",
+                (value, utc_datetime_str(), name),
             )
             await db.commit()
             return True
@@ -905,23 +1006,18 @@ class SQLiteStore:
     async def add_character(self, character: NovelCharacter) -> None:
         db = await self._ensure_db()
         await db.execute(
-            """INSERT INTO characters (name, aliases_json, role, is_main, gender, age_group,
-               body_type, fish_voice_id, description, face_prompt, appearance_details, identities_json,
-               reference_audio_path, reference_audio_sha256, reference_audio_updated_at,
-               voice_samples_by_age_group_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(name) DO UPDATE SET
-               aliases_json=excluded.aliases_json, role=excluded.role,
-               is_main=excluded.is_main, gender=excluded.gender,
-               age_group=excluded.age_group, body_type=excluded.body_type,
-               fish_voice_id=excluded.fish_voice_id, description=excluded.description,
-               face_prompt=excluded.face_prompt, appearance_details=excluded.appearance_details,
-               identities_json=excluded.identities_json,
-               reference_audio_path=excluded.reference_audio_path,
-               reference_audio_sha256=excluded.reference_audio_sha256,
-               reference_audio_updated_at=excluded.reference_audio_updated_at,
-               voice_samples_by_age_group_json=excluded.voice_samples_by_age_group_json,
-               updated_at=datetime('now')""",
+            upsert_sql(
+                "characters",
+                ("name",),
+                (
+                    "name", "aliases_json", "role", "is_main", "gender", "age_group",
+                    "body_type", "fish_voice_id", "description", "face_prompt",
+                    "appearance_details", "identities_json", "reference_audio_path",
+                    "reference_audio_sha256", "reference_audio_updated_at",
+                    "voice_samples_by_age_group_json",
+                ),
+                touch_cols=("updated_at",),
+            ),
             (
                 character.name,
                 json.dumps(character.aliases, ensure_ascii=False),
@@ -939,6 +1035,7 @@ class SQLiteStore:
                 character.reference_audio_sha256,
                 character.reference_audio_updated_at,
                 character.voice_samples_by_age_group_json,
+                utc_datetime_str(),
             ),
         )
         await db.commit()
@@ -976,31 +1073,34 @@ class SQLiteStore:
             return []
 
         try:
-            await db.execute("BEGIN")
-            for character in pending:
-                await db.execute(
-                    """INSERT INTO characters
-                       (name, aliases_json, role, is_main, gender, age_group,
-                        body_type, fish_voice_id, description, face_prompt,
-                        appearance_details, identities_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(name) DO NOTHING""",
-                    (
-                        character.name,
-                        json.dumps(character.aliases, ensure_ascii=False),
-                        character.role,
-                        1 if character.is_main else 0,
-                        character.gender,
-                        character.age_group,
-                        character.body_type,
-                        character.fish_voice_id,
-                        character.description,
-                        character.face_prompt,
-                        character.appearance_details,
-                        character.identities_json,
-                    ),
-                )
-            await db.commit()
+            async with tx(db):
+                for character in pending:
+                    await db.execute(
+                        insert_do_nothing_sql(
+                            "characters",
+                            (
+                                "name", "aliases_json", "role", "is_main", "gender",
+                                "age_group", "body_type", "fish_voice_id",
+                                "description", "face_prompt", "appearance_details",
+                                "identities_json",
+                            ),
+                            ("name",),
+                        ),
+                        (
+                            character.name,
+                            json.dumps(character.aliases, ensure_ascii=False),
+                            character.role,
+                            1 if character.is_main else 0,
+                            character.gender,
+                            character.age_group,
+                            character.body_type,
+                            character.fish_voice_id,
+                            character.description,
+                            character.face_prompt,
+                            character.appearance_details,
+                            character.identities_json,
+                        ),
+                    )
         except Exception:
             await db.rollback()
             raise
@@ -1046,9 +1146,8 @@ class SQLiteStore:
 
         db = await self._ensure_db()
         cursor = await db.execute(
-            "UPDATE characters SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
-            "WHERE name = ?",
-            (name,),
+            "UPDATE characters SET updated_at = ? WHERE name = ?",
+            (utc_iso_ms(), name),
         )
         await db.commit()
         return (cursor.rowcount or 0) > 0
@@ -1174,9 +1273,9 @@ class SQLiteStore:
                 continue
             assignments = ", ".join(f"{column} = ?" for column in updates)
             await db.execute(
-                f"UPDATE episodes SET {assignments}, updated_at = datetime('now') "
+                f"UPDATE episodes SET {assignments}, updated_at = ? "
                 "WHERE number = ?",
-                (*updates.values(), row["number"]),
+                (*updates.values(), utc_datetime_str(), row["number"]),
             )
 
         async with db.execute(
@@ -1214,9 +1313,9 @@ class SQLiteStore:
                 continue
             assignments = ", ".join(f"{column} = ?" for column in updates)
             await db.execute(
-                f"UPDATE beats SET {assignments}, updated_at = datetime('now') "
+                f"UPDATE beats SET {assignments}, updated_at = ? "
                 "WHERE episode_number = ? AND beat_number = ?",
-                (*updates.values(), row["episode_number"], row["beat_number"]),
+                (*updates.values(), utc_datetime_str(), row["episode_number"], row["beat_number"]),
             )
 
         # props.owner 两种格式混着存：字段声明写的是「所属角色名」，而
@@ -1232,8 +1331,8 @@ class SQLiteStore:
             if remapped_owner == owner:
                 continue
             await db.execute(
-                "UPDATE props SET owner = ?, updated_at = datetime('now') WHERE name = ?",
-                (remapped_owner, row["name"]),
+                "UPDATE props SET owner = ?, updated_at = ? WHERE name = ?",
+                (remapped_owner, utc_datetime_str(), row["name"]),
             )
 
         await self._cascade_voice_record_speaker(db, old_name, new_name)
@@ -1262,12 +1361,8 @@ class SQLiteStore:
         """
 
         table = "seedance2_voice_audio_records"
-        async with db.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-            (table,),
-        ) as cursor:
-            if await cursor.fetchone() is None:
-                return
+        if not await table_exists_async(db, table):
+            return
 
         async with db.execute(
             f"SELECT episode_number, beat_number, speaker FROM {table}"
@@ -1381,11 +1476,12 @@ class SQLiteStore:
                         identity["identity_id"] = f"{new_name}_{identity_name}"
                 await db.execute(
                     f"UPDATE {table} SET name = ?, aliases_json = ?, identities_json = ?, "
-                    f"updated_at = datetime('now') WHERE name = ?",
+                    f"updated_at = ? WHERE name = ?",
                     (
                         new_name,
                         json.dumps(aliases, ensure_ascii=False),
                         json.dumps(identities, ensure_ascii=False),
+                        utc_datetime_str(),
                         old_name,
                     ),
                 )
@@ -1395,17 +1491,17 @@ class SQLiteStore:
             else:
                 await db.execute(
                     f"UPDATE {table} SET name = ?, aliases_json = ?, "
-                    f"updated_at = datetime('now') WHERE name = ?",
-                    (new_name, json.dumps(aliases, ensure_ascii=False), old_name),
+                    f"updated_at = ? WHERE name = ?",
+                    (new_name, json.dumps(aliases, ensure_ascii=False), utc_datetime_str(), old_name),
                 )
             if kind == "scene":
                 # 派生场景按名字挂在母场景上，母场景改名后这些指针要跟着走，否则分组会
                 # 散架。必须和上面的改名同一个事务：一旦这一行提交了，名字就已经安全，
                 # 下次启动的自愈不会再看这一行，落下的 base_scene_id 就永远不会被补。
                 await db.execute(
-                    "UPDATE scenes SET base_scene_id = ?, updated_at = datetime('now') "
+                    "UPDATE scenes SET base_scene_id = ?, updated_at = ? "
                     "WHERE base_scene_id = ?",
-                    (new_name, old_name),
+                    (new_name, utc_datetime_str(), old_name),
                 )
             # 逐行提交：目录已经搬到新名下了，这一行的改名必须立刻落库。攒到最后一次性
             # 提交的话，中途任何一行抛异常都会让「盘上新名、库里旧名」这批错位留在磁盘
@@ -1432,22 +1528,16 @@ class SQLiteStore:
         """添加或更新场景。"""
         db = await self._ensure_db()
         await db.execute(
-            """INSERT INTO scenes (name, aliases_json, scene_type,
-               base_scene_id, variant_id, time_of_day,
-               environment_prompt, variant_prompt, description, spatial_layout_image, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(name) DO UPDATE SET
-               aliases_json=excluded.aliases_json,
-               scene_type=excluded.scene_type,
-               base_scene_id=excluded.base_scene_id,
-               variant_id=excluded.variant_id,
-               time_of_day=excluded.time_of_day,
-               environment_prompt=excluded.environment_prompt,
-               variant_prompt=excluded.variant_prompt,
-               description=excluded.description,
-               spatial_layout_image=excluded.spatial_layout_image,
-               notes=excluded.notes,
-               updated_at=datetime('now')""",
+            upsert_sql(
+                "scenes",
+                ("name",),
+                (
+                    "name", "aliases_json", "scene_type", "base_scene_id",
+                    "variant_id", "time_of_day", "environment_prompt",
+                    "variant_prompt", "description", "spatial_layout_image", "notes",
+                ),
+                touch_cols=("updated_at",),
+            ),
             (
                 scene.name,
                 json.dumps(scene.aliases, ensure_ascii=False),
@@ -1460,6 +1550,7 @@ class SQLiteStore:
                 scene.description,
                 scene.spatial_layout_image,
                 scene.notes,
+                utc_datetime_str(),
             ),
         )
         await db.commit()
@@ -1515,7 +1606,8 @@ class SQLiteStore:
                 values.append(value)
         if not set_parts:
             return False
-        set_parts.append("updated_at = datetime('now')")
+        set_parts.append("updated_at = ?")
+        values.append(utc_datetime_str())
         values.append(name)
         db = await self._ensure_db()
         cursor = await db.execute(
@@ -1530,9 +1622,8 @@ class SQLiteStore:
 
         db = await self._ensure_db()
         cursor = await db.execute(
-            "UPDATE scenes SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
-            "WHERE name = ?",
-            (name,),
+            "UPDATE scenes SET updated_at = ? WHERE name = ?",
+            (utc_iso_ms(), name),
         )
         await db.commit()
         return (cursor.rowcount or 0) > 0
@@ -1547,8 +1638,8 @@ class SQLiteStore:
             return False
         db = await self._ensure_db()
         cursor = await db.execute(
-            "UPDATE scenes SET name = ?, updated_at = datetime('now') WHERE name = ?",
-            (new_name, old_name),
+            "UPDATE scenes SET name = ?, updated_at = ? WHERE name = ?",
+            (new_name, utc_datetime_str(), old_name),
         )
         await db.commit()
         return (cursor.rowcount or 0) > 0
@@ -1584,17 +1675,15 @@ class SQLiteStore:
         """添加或更新道具。"""
         db = await self._ensure_db()
         await db.execute(
-            """INSERT INTO props (name, aliases_json, prop_type, visual_prompt,
-               description, owner, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(name) DO UPDATE SET
-               aliases_json=excluded.aliases_json,
-               prop_type=excluded.prop_type,
-               visual_prompt=excluded.visual_prompt,
-               description=excluded.description,
-               owner=excluded.owner,
-               notes=excluded.notes,
-               updated_at=datetime('now')""",
+            upsert_sql(
+                "props",
+                ("name",),
+                (
+                    "name", "aliases_json", "prop_type", "visual_prompt",
+                    "description", "owner", "notes",
+                ),
+                touch_cols=("updated_at",),
+            ),
             (
                 prop.name,
                 json.dumps(prop.aliases, ensure_ascii=False),
@@ -1603,6 +1692,7 @@ class SQLiteStore:
                 prop.description,
                 prop.owner,
                 prop.notes,
+                utc_datetime_str(),
             ),
         )
         await db.commit()
@@ -1655,7 +1745,8 @@ class SQLiteStore:
                 values.append(value)
         if not set_parts:
             return False
-        set_parts.append("updated_at = datetime('now')")
+        set_parts.append("updated_at = ?")
+        values.append(utc_datetime_str())
         values.append(name)
         db = await self._ensure_db()
         cursor = await db.execute(
@@ -1677,9 +1768,8 @@ class SQLiteStore:
 
         db = await self._ensure_db()
         cursor = await db.execute(
-            "UPDATE props SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
-            "WHERE name = ?",
-            (name,),
+            "UPDATE props SET updated_at = ? WHERE name = ?",
+            (utc_iso_ms(), name),
         )
         await db.commit()
         return (cursor.rowcount or 0) > 0
@@ -1694,8 +1784,8 @@ class SQLiteStore:
             return False
         db = await self._ensure_db()
         cursor = await db.execute(
-            "UPDATE props SET name = ?, updated_at = datetime('now') WHERE name = ?",
-            (new_name, old_name),
+            "UPDATE props SET name = ?, updated_at = ? WHERE name = ?",
+            (new_name, utc_datetime_str(), old_name),
         )
         await db.commit()
         if (cursor.rowcount or 0) > 0:
@@ -1859,23 +1949,19 @@ class SQLiteStore:
 
         for ep in episodes:
             await db.execute(
-                """INSERT INTO episodes (number, title, chapter_start, chapter_end,
-                   raw_content, beat_source_text, content_summary, main_conflict, cliffhanger, key_events,
-                   character_names, identity_ids, event_ids, scene_menu_json, prop_menu_json,
-                   identity_default_map_json, sketch_colors_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(number) DO UPDATE SET
-                   title=excluded.title, chapter_start=excluded.chapter_start,
-                   chapter_end=excluded.chapter_end, raw_content=excluded.raw_content,
-                   beat_source_text=excluded.beat_source_text,
-                   content_summary=excluded.content_summary,
-                   main_conflict=excluded.main_conflict, cliffhanger=excluded.cliffhanger,
-                   key_events=excluded.key_events, character_names=excluded.character_names,
-                   identity_ids=excluded.identity_ids, event_ids=excluded.event_ids,
-                   scene_menu_json=excluded.scene_menu_json, prop_menu_json=excluded.prop_menu_json,
-                   identity_default_map_json=excluded.identity_default_map_json,
-                   sketch_colors_json=excluded.sketch_colors_json,
-                   updated_at=datetime('now')""",
+                upsert_sql(
+                    "episodes",
+                    ("number",),
+                    (
+                        "number", "title", "chapter_start", "chapter_end",
+                        "raw_content", "beat_source_text", "content_summary",
+                        "main_conflict", "cliffhanger", "key_events",
+                        "character_names", "identity_ids", "event_ids",
+                        "scene_menu_json", "prop_menu_json",
+                        "identity_default_map_json", "sketch_colors_json",
+                    ),
+                    touch_cols=("updated_at",),
+                ),
                 (
                     ep.number,
                     ep.title,
@@ -1894,6 +1980,7 @@ class SQLiteStore:
                     ep.prop_menu_json,
                     ep.identity_default_map_json,
                     ep.sketch_colors_json,
+                    utc_datetime_str(),
                 ),
             )
 
@@ -2220,7 +2307,8 @@ class SQLiteStore:
             return
 
         db = await self._ensure_db()
-        assignments.append("updated_at = datetime('now')")
+        assignments.append("updated_at = ?")
+        params.append(utc_datetime_str())
         params.append(int(episode_number))
         cursor = await db.execute(
             f"UPDATE episodes SET {', '.join(assignments)} WHERE number = ?",
@@ -2507,9 +2595,9 @@ class SQLiteStore:
         db = await self._ensure_db()
         colors_json = json.dumps(colors, ensure_ascii=False)
         await db.execute(
-            "UPDATE episodes SET sketch_colors_json = ?, updated_at = datetime('now') "
+            "UPDATE episodes SET sketch_colors_json = ?, updated_at = ? "
             "WHERE number = ?",
-            (colors_json, episode_number),
+            (colors_json, utc_datetime_str(), episode_number),
         )
         await db.commit()
         episode = self._episodes.get(episode_number)
@@ -2740,8 +2828,8 @@ class SQLiteStore:
         try:
             db = await self._ensure_db()
             set_parts = [f"{key} = ?" for key in properties]
-            set_parts.append("updated_at = datetime('now')")
-            values = list(properties.values()) + [episode_number, bn]
+            set_parts.append("updated_at = ?")
+            values = list(properties.values()) + [utc_datetime_str(), episode_number, bn]
             await db.execute(
                 f"UPDATE beats SET {', '.join(set_parts)} "
                 f"WHERE episode_number = ? AND beat_number = ?",
@@ -2758,27 +2846,19 @@ class SQLiteStore:
         db = await self._ensure_db()
         for b in beats:
             await db.execute(
-                """INSERT INTO beats (episode_number, beat_number, narration, visual_description,
-                   detected_identities_json, detected_props_json, scene_ref_json,
-                   audio_type, speaker, speaker_kind, time_of_day,
-                   video_mode, video_prompt, keyframe_prompt,
-                   shot_order, duration_seconds, is_manual_shot)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(episode_number, beat_number) DO UPDATE SET
-                   narration=excluded.narration, visual_description=excluded.visual_description,
-                   detected_identities_json=excluded.detected_identities_json,
-                   detected_props_json=excluded.detected_props_json,
-                   scene_ref_json=excluded.scene_ref_json,
-                   audio_type=excluded.audio_type, speaker=excluded.speaker,
-                   speaker_kind=excluded.speaker_kind,
-                   time_of_day=excluded.time_of_day,
-                   video_mode=excluded.video_mode,
-                   video_prompt=excluded.video_prompt,
-                   keyframe_prompt=excluded.keyframe_prompt,
-                   shot_order=excluded.shot_order,
-                   duration_seconds=excluded.duration_seconds,
-                   is_manual_shot=excluded.is_manual_shot,
-                   updated_at=datetime('now')""",
+                upsert_sql(
+                    "beats",
+                    ("episode_number", "beat_number"),
+                    (
+                        "episode_number", "beat_number", "narration",
+                        "visual_description", "detected_identities_json",
+                        "detected_props_json", "scene_ref_json", "audio_type",
+                        "speaker", "speaker_kind", "time_of_day", "video_mode",
+                        "video_prompt", "keyframe_prompt", "shot_order",
+                        "duration_seconds", "is_manual_shot",
+                    ),
+                    touch_cols=("updated_at",),
+                ),
                 (
                     b.episode_number,
                     b.beat_number,
@@ -2797,6 +2877,7 @@ class SQLiteStore:
                     getattr(b, "shot_order", None),
                     getattr(b, "duration_seconds", None),
                     1 if getattr(b, "is_manual_shot", False) else 0,
+                    utc_datetime_str(),
                 ),
             )
         await db.commit()
@@ -2883,10 +2964,11 @@ class SQLiteStore:
         count = 0
         for beat_number, ids in detections.items():
             cursor = await db.execute(
-                "UPDATE beats SET detected_identities_json = ?, updated_at = datetime('now') "
+                "UPDATE beats SET detected_identities_json = ?, updated_at = ? "
                 "WHERE episode_number = ? AND beat_number = ?",
                 (
                     json.dumps(normalize_detected_identities(ids), ensure_ascii=False),
+                    utc_datetime_str(),
                     episode_number,
                     beat_number,
                 ),
@@ -2907,10 +2989,11 @@ class SQLiteStore:
         count = 0
         for beat_number, ids in detections.items():
             cursor = await db.execute(
-                "UPDATE beats SET detected_props_json = ?, updated_at = datetime('now') "
+                "UPDATE beats SET detected_props_json = ?, updated_at = ? "
                 "WHERE episode_number = ? AND beat_number = ?",
                 (
                     json.dumps(normalize_detected_props(ids), ensure_ascii=False),
+                    utc_datetime_str(),
                     episode_number,
                     beat_number,
                 ),
@@ -2957,10 +3040,11 @@ class SQLiteStore:
             if beat_number <= 0 or scene_ref is None:
                 continue
             cursor = await db.execute(
-                "UPDATE beats SET scene_ref_json = ?, updated_at = datetime('now') "
+                "UPDATE beats SET scene_ref_json = ?, updated_at = ? "
                 "WHERE episode_number = ? AND beat_number = ?",
                 (
                     json.dumps(scene_ref, ensure_ascii=False) if scene_ref else "",
+                    utc_datetime_str(),
                     episode_number,
                     beat_number,
                 ),
@@ -3024,44 +3108,50 @@ class SQLiteStore:
         """
         db = await self._ensure_db()
         try:
-            await db.execute("BEGIN")
-            await db.execute(
-                """INSERT OR REPLACE INTO story_analysis_runs
-                   (run_id, pipeline_version, schema_version, spine_template,
-                    source_sha256, source_length, status, error, completed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'pending', '', '')""",
-                (
-                    run_id,
-                    pipeline_version,
-                    int(schema_version),
-                    spine_template,
-                    source_sha256,
-                    int(source_length),
-                ),
-            )
-            await db.execute(
-                "DELETE FROM story_analysis_chunks WHERE run_id = ?", (run_id,)
-            )
-            await db.executemany(
-                """INSERT INTO story_analysis_chunks
-                   (run_id, chunk_id, chunk_index, section_type, section_label,
-                    source_start, source_end, source_hash, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
-                [
+            async with tx(db):
+                await db.execute(
+                    replace_into_sql(
+                        "story_analysis_runs",
+                        (
+                            "run_id", "pipeline_version", "schema_version",
+                            "spine_template", "source_sha256", "source_length",
+                            "status", "error", "completed_at",
+                        ),
+                    ),
                     (
                         run_id,
-                        chunk.chunk_id,
-                        int(chunk.chunk_index),
-                        chunk.section_type,
-                        chunk.section_label,
-                        int(chunk.source_start),
-                        int(chunk.source_end),
-                        chunk.source_hash,
-                    )
-                    for chunk in chunks
-                ],
-            )
-            await db.commit()
+                        pipeline_version,
+                        int(schema_version),
+                        spine_template,
+                        source_sha256,
+                        int(source_length),
+                        "pending",
+                        "",
+                        "",
+                    ),
+                )
+                await db.execute(
+                    "DELETE FROM story_analysis_chunks WHERE run_id = ?", (run_id,)
+                )
+                await db.executemany(
+                    """INSERT INTO story_analysis_chunks
+                       (run_id, chunk_id, chunk_index, section_type, section_label,
+                        source_start, source_end, source_hash, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+                    [
+                        (
+                            run_id,
+                            chunk.chunk_id,
+                            int(chunk.chunk_index),
+                            chunk.section_type,
+                            chunk.section_label,
+                            int(chunk.source_start),
+                            int(chunk.source_end),
+                            chunk.source_hash,
+                        )
+                        for chunk in chunks
+                    ],
+                )
         except Exception:
             await db.rollback()
             raise
@@ -3111,9 +3201,9 @@ class SQLiteStore:
         db = await self._ensure_db()
         await db.execute(
             """UPDATE story_analysis_runs
-               SET status = ?, error = ?, completed_at = datetime('now')
+               SET status = ?, error = ?, completed_at = ?
                WHERE run_id = ?""",
-            (status, str(error)[:2000], run_id),
+            (status, str(error)[:2000], utc_datetime_str(), run_id),
         )
         await db.commit()
 
@@ -3140,13 +3230,12 @@ class SQLiteStore:
         """
         db = await self._ensure_db()
         await db.execute(
-            """INSERT INTO story_analysis_artifacts
-               (run_id, artifact_type, result_json, created_at)
-               VALUES (?, ?, ?, datetime('now'))
-               ON CONFLICT(run_id, artifact_type) DO UPDATE SET
-                 result_json = excluded.result_json,
-                 created_at = excluded.created_at""",
-            (run_id, artifact_type, result_json),
+            upsert_sql(
+                "story_analysis_artifacts",
+                ("run_id", "artifact_type"),
+                ("run_id", "artifact_type", "result_json", "created_at"),
+            ),
+            (run_id, artifact_type, result_json, utc_datetime_str()),
         )
         await db.commit()
 
@@ -3186,17 +3275,16 @@ class SQLiteStore:
         only ever a result for identical input under the current contract; there
         is nothing to invalidate and no run to scope it to.
         """
-        rows = [(key, artifact_type, value) for key, value in results.items() if key]
+        rows = [(key, artifact_type, value, utc_datetime_str()) for key, value in results.items() if key]
         if not rows:
             return
         db = await self._ensure_db()
         await db.executemany(
-            """INSERT INTO story_analysis_item_cache
-               (cache_key, artifact_type, result_json, created_at)
-               VALUES (?, ?, ?, datetime('now'))
-               ON CONFLICT(cache_key) DO UPDATE SET
-                 result_json = excluded.result_json,
-                 created_at = excluded.created_at""",
+            upsert_sql(
+                "story_analysis_item_cache",
+                ("cache_key",),
+                ("cache_key", "artifact_type", "result_json", "created_at"),
+            ),
             rows,
         )
         await db.commit()
@@ -3211,32 +3299,35 @@ class SQLiteStore:
         """
         db = await self._ensure_db()
         try:
-            await db.execute("BEGIN")
-            await db.execute(
-                """DELETE FROM entity_evidence
-                   WHERE run_id = ? AND entity_type = ? AND entity_id = ?""",
-                (run_id, entity_type, entity_id),
-            )
-            await db.executemany(
-                """INSERT OR REPLACE INTO entity_evidence
-                   (run_id, entity_type, entity_id, chunk_id, source_start,
-                    source_end, evidence_kind, evidence_text)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                [
-                    (
-                        run_id,
-                        entity_type,
-                        entity_id,
-                        str(item.get("chunk_id", "")),
-                        int(item.get("source_start", 0)),
-                        int(item.get("source_end", 0)),
-                        str(item.get("evidence_kind", "")),
-                        str(item.get("evidence_text", "")),
-                    )
-                    for item in evidence
-                ],
-            )
-            await db.commit()
+            async with tx(db):
+                await db.execute(
+                    """DELETE FROM entity_evidence
+                       WHERE run_id = ? AND entity_type = ? AND entity_id = ?""",
+                    (run_id, entity_type, entity_id),
+                )
+                await db.executemany(
+                    replace_into_sql(
+                        "entity_evidence",
+                        (
+                            "run_id", "entity_type", "entity_id", "chunk_id",
+                            "source_start", "source_end", "evidence_kind",
+                            "evidence_text",
+                        ),
+                    ),
+                    [
+                        (
+                            run_id,
+                            entity_type,
+                            entity_id,
+                            str(item.get("chunk_id", "")),
+                            int(item.get("source_start", 0)),
+                            int(item.get("source_end", 0)),
+                            str(item.get("evidence_kind", "")),
+                            str(item.get("evidence_text", "")),
+                        )
+                        for item in evidence
+                    ],
+                )
         except Exception:
             await db.rollback()
             raise

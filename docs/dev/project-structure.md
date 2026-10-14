@@ -9,7 +9,7 @@
 
 ![DramaClaw CE 系统架构](architecture-system.svg)
 
-**一句话**:单机「小说 → 短剧成片」流水线 —— React 前端(`:8080`)→ FastAPI 后端(`:8780`)→ 端口层 → 创作引擎/任务后端 → 本地 SQLite + 文件存储;所有模型调用统一经 OpenAI 兼容的 newAPI 网关(`:3000`)。无 PostgreSQL / Redis 依赖。
+**一句话**:单机「小说 → 短剧成片」流水线 —— React 前端(`:8080`)→ FastAPI 后端(`:8780`)→ 端口层 → 创作引擎/任务后端 → 本地 SQLite(可选 MySQL)+ 文件存储;所有模型调用统一经 OpenAI 兼容的 newAPI 网关(`:3000`)。无 Redis 依赖。
 
 **分层职责**:
 
@@ -20,7 +20,7 @@
 | 端口层 | `src/novelvideo/ports/` | 约 20 个 Protocol;`ST_EDITION=ce` → `ports/local/` 内置实现;核心代码永不 import 企业实现(有 lint 门禁) |
 | 创作引擎 | `agents/` `cognee/` `structured_*` `generators/` `verification/` `seedance2_i2v/` `workflows/` `export/` | 规划、生成、校验、导出(见流水线图) |
 | 任务后端 | `src/novelvideo/task_backend/` | CE 为进程内 inline:HMAC 签名信封 → 队列/五级限流 → runner ×15 → SSE 进度/取消/断点续跑 |
-| 存储 | `state/` `output/` | 每项目一个 SQLite;素材与成片按目录组织 |
+| 存储 | `state/` `output/` | 关系数据默认每项目一个 SQLite;`NOVELVIDEO_DB_DSN` 配置 `mysql://` 时全部自研存储切到单库 MySQL(按原文件路径哈希做表名前缀,见 `db/`);素材与成片按目录组织 |
 | 模型接入 | `config.py` `model_gateway_*` | 全部文本/图片/视频/音频模型走 newAPI 网关,凭据存 `settings.db` 不进环境变量 |
 
 **流水线**(数据流视角):
@@ -130,6 +130,8 @@ $NOVELVIDEO_DATA_ROOT(默认当前目录;Docker 固定 /data)
 ```
 
 全局还有:`task_states` 任务表、`image/audio/video_request_usage` 用量表、`chat_*` 会话表、验证侧 `accepted_sketch_samples`/`reject_buffer` 训练表(各自 SQLite)。
+
+**MySQL 后端(可选)**:`NOVELVIDEO_DB_DSN` 配置 `mysql://` 时,上述全部 SQLite 逻辑库映射到单个 MySQL database——每个原 SQLite 文件按相对路径哈希派生一个表名前缀(`t_<hash>__`,全局库如 settings/projects/verification 用 `g_*__` 固定前缀),schema 由 `db/ddl_translate.py` 从原 SQLite DDL 自动翻译、`db/schema_runner.py` 用 `GET_LOCK` + `mv_schema_migrations` 台账做幂等迁移,原文件路径登记在 `mv_scopes`。SQLite 仍是缺省后端,不配 DSN 行为不变。历史数据用 `scripts/migrate_sqlite_to_mysql.py` 一次性导入。
 
 ---
 

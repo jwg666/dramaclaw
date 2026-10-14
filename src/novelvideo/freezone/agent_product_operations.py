@@ -17,6 +17,11 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from novelvideo.db.sql_compat import (
+    immediate_tx_sync,
+    insert_ignore_sql,
+    upsert_sql,
+)
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
 
 SCHEMA_VERSION = "freezone_agent_product_operation.v1"
@@ -225,8 +230,9 @@ def create_agent_product_operation(
         raise ValueError("canvas_id is required for workflow_result operations")
     now = time.time()
     operation_id = f"agent_product_{uuid.uuid4().hex}"
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"freezone_agent_product_operations:{clean_key}"
+    ):
         existing = conn.execute(
             "SELECT * FROM freezone_agent_product_operations WHERE idempotency_key = ?",
             (clean_key,),
@@ -320,8 +326,9 @@ def bind_agent_product_task(
     clean_root_id = str(root_task_id or "").strip()
     if not clean_task_id or not clean_root_id:
         raise ValueError("task identity is required")
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"freezone_agent_product_operations:{operation_id}"
+    ):
         current = conn.execute(
             "SELECT * FROM freezone_agent_product_operations WHERE operation_id = ?",
             (operation_id,),
@@ -386,8 +393,9 @@ def bind_agent_product_model_execution(
             else {}
         ),
     }
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"freezone_agent_product_operations:{operation_id}"
+    ):
         current = conn.execute(
             "SELECT * FROM freezone_agent_product_operations WHERE operation_id = ?",
             (operation_id,),
@@ -419,11 +427,10 @@ def bind_agent_product_model_execution(
         )
         if str(compiled_prompt or "").strip():
             conn.execute(
-                """
-                INSERT OR IGNORE INTO freezone_recipe_model_prompts (
-                    operation_id, model_call_id, prompt, created_at
-                ) VALUES (?, ?, ?, ?)
-                """,
+                insert_ignore_sql(
+                    "freezone_recipe_model_prompts",
+                    ("operation_id", "model_call_id", "prompt", "created_at"),
+                ),
                 (operation_id, clean_model_call_id, compiled_prompt, now),
             )
         row = conn.execute(
@@ -472,8 +479,9 @@ def finish_agent_product_operation(
     status = str(outcome or "").strip()
     if status not in PENDING_STATUSES | TERMINAL_STATUSES:
         raise ValueError("invalid agent product operation outcome")
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"freezone_agent_product_operations:{operation_id}"
+    ):
         current = conn.execute(
             "SELECT * FROM freezone_agent_product_operations WHERE operation_id = ?",
             (operation_id,),
@@ -594,8 +602,9 @@ def save_agent_generation_session(
     if not session_id:
         raise ValueError("generation_session_id is required")
     now = time.time()
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"freezone_agent_generation_sessions:{session_id}"
+    ):
         existing = conn.execute(
             "SELECT project_id FROM freezone_agent_generation_sessions WHERE generation_session_id = ?",
             (session_id,),
@@ -603,17 +612,20 @@ def save_agent_generation_session(
         if existing is not None and str(existing["project_id"]) != str(project_id):
             raise ValueError("generation session belongs to another project")
         conn.execute(
-            """
-            INSERT INTO freezone_agent_generation_sessions(
-                generation_session_id, project_id, canvas_id, manifest_json,
-                draft_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(generation_session_id) DO UPDATE SET
-                canvas_id = excluded.canvas_id,
-                manifest_json = excluded.manifest_json,
-                draft_json = excluded.draft_json,
-                updated_at = excluded.updated_at
-            """,
+            upsert_sql(
+                "freezone_agent_generation_sessions",
+                ("generation_session_id",),
+                (
+                    "generation_session_id", "project_id", "canvas_id",
+                    "manifest_json", "draft_json", "created_at", "updated_at",
+                ),
+                set_sql=(
+                    "canvas_id = excluded.canvas_id, "
+                    "manifest_json = excluded.manifest_json, "
+                    "draft_json = excluded.draft_json, "
+                    "updated_at = excluded.updated_at"
+                ),
+            ),
             (
                 session_id,
                 project_id,

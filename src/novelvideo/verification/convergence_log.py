@@ -10,6 +10,8 @@ from typing import Any
 
 import aiosqlite
 
+from novelvideo.db.sql_compat import utc_datetime_str
+
 
 async def next_round_num(
     db: aiosqlite.Connection,
@@ -45,7 +47,7 @@ async def write_round(
             episode_number, phase, round_num,
             residual_count, fixed_count, new_failures_json,
             started_at, ended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             int(episode_num),
@@ -54,6 +56,8 @@ async def write_round(
             int(residual_count),
             int(fixed_count),
             json.dumps(new_failures or [], ensure_ascii=False),
+            utc_datetime_str(),
+            utc_datetime_str(),
         ),
     )
     await db.commit()

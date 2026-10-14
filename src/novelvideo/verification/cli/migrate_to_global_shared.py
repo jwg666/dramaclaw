@@ -41,6 +41,7 @@ from pathlib import Path
 import aiosqlite
 
 from novelvideo.config import STATE_DIR
+from novelvideo.db.sql_compat import insert_ignore_sql, upsert_sql, utc_datetime_str
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +72,35 @@ def _discover_user_shared_dirs() -> list[Path]:
     return out
 
 
+async def _open_dst_db(dst: Path):
+    """Open the merge-destination connection.
+
+    SQLite: a plain aiosqlite connection to the file. MySQL: an adapter
+    async connection bound to the destination's logical scope (the file
+    path is only the scope identity). Callers close it themselves.
+    """
+    from novelvideo.db.sql_compat import BACKEND_MYSQL, active_backend
+
+    if active_backend() == BACKEND_MYSQL:
+        from novelvideo.db.adapter import acquire_async
+        from novelvideo.db.dsn import scope_identity
+
+        key, _relpath = scope_identity(dst)
+        return await acquire_async(key)
+    return await aiosqlite.connect(str(dst))
+
+
+def _ensure_dst_schema_mysql(dst: Path, ensure_fn) -> bool:
+    """MySQL 后端:在目标作用域上确保 schema(阻塞);返回是否 MySQL。"""
+
+    from novelvideo.db.sql_compat import BACKEND_MYSQL, active_backend
+
+    if active_backend() != BACKEND_MYSQL:
+        return False
+    ensure_fn(dst)
+    return True
+
+
 async def _merge_verification_db(src: Path, dst: Path, dry_run: bool) -> tuple[int, int]:
     """Return (rows_considered, rows_inserted)."""
     if not src.exists():
@@ -78,11 +108,15 @@ async def _merge_verification_db(src: Path, dst: Path, dry_run: bool) -> tuple[i
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     # Ensure destination has schema
-    from novelvideo.verification.global_registry_db import DEFS_SCHEMA_SQL
+    from novelvideo.verification.global_registry_db import (
+        DEFS_SCHEMA_SQL,
+        ensure_defs_schema_mysql,
+    )
 
-    async with aiosqlite.connect(str(dst)) as db_dst:
-        await db_dst.executescript(DEFS_SCHEMA_SQL)
-        await db_dst.commit()
+    if not _ensure_dst_schema_mysql(dst, ensure_defs_schema_mysql):
+        async with aiosqlite.connect(str(dst)) as db_dst:
+            await db_dst.executescript(DEFS_SCHEMA_SQL)
+            await db_dst.commit()
 
     async with aiosqlite.connect(str(src)) as db_src:
         db_src.row_factory = aiosqlite.Row
@@ -99,28 +133,31 @@ async def _merge_verification_db(src: Path, dst: Path, dry_run: bool) -> tuple[i
     if dry_run:
         return len(rows), 0
 
-    async with aiosqlite.connect(str(dst)) as db_dst:
+    db_dst = await _open_dst_db(dst)
+    try:
         inserted = 0
+        merge_upsert_sql = upsert_sql(
+            "sketch_failure_mode_defs",
+            ("code",),
+            (
+                "code", "layer", "detection", "prevention_rule",
+                "correction_template", "negative_prompt_clause",
+                "gate_enabled", "fixture_path", "created_at", "updated_at",
+            ),
+            set_sql=(
+                "layer = excluded.layer, "
+                "detection = excluded.detection, "
+                "prevention_rule = excluded.prevention_rule, "
+                "correction_template = excluded.correction_template, "
+                "negative_prompt_clause = excluded.negative_prompt_clause, "
+                "gate_enabled = excluded.gate_enabled"
+            ),
+            touch_cols=("updated_at",),
+        )
         for row in rows:
             data = dict(row)
             await db_dst.execute(
-                """
-                INSERT INTO sketch_failure_mode_defs (
-                    code, layer, detection, prevention_rule,
-                    correction_template, negative_prompt_clause,
-                    gate_enabled, fixture_path, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?,
-                          COALESCE(?, datetime('now')),
-                          datetime('now'))
-                ON CONFLICT(code) DO UPDATE SET
-                    layer = excluded.layer,
-                    detection = excluded.detection,
-                    prevention_rule = excluded.prevention_rule,
-                    correction_template = excluded.correction_template,
-                    negative_prompt_clause = excluded.negative_prompt_clause,
-                    gate_enabled = excluded.gate_enabled,
-                    updated_at = datetime('now')
-                """,
+                merge_upsert_sql,
                 (
                     data["code"], data["layer"], data["detection"],
                     data.get("prevention_rule") or "",
@@ -128,11 +165,15 @@ async def _merge_verification_db(src: Path, dst: Path, dry_run: bool) -> tuple[i
                     data.get("negative_prompt_clause") or "",
                     int(data.get("gate_enabled") or 0),
                     data.get("fixture_path") or "",
-                    data.get("created_at"),
+                    data.get("created_at") or utc_datetime_str(),
+                    utc_datetime_str(),
+                    utc_datetime_str(),
                 ),
             )
             inserted += 1
         await db_dst.commit()
+    finally:
+        await db_dst.close()
     return len(rows), inserted
 
 
@@ -141,11 +182,15 @@ async def _merge_training_db(src: Path, dst: Path, dry_run: bool) -> dict[str, i
         return {}
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    from novelvideo.verification.training_db import TRAINING_SCHEMA_SQL
+    from novelvideo.verification.training_db import (
+        TRAINING_SCHEMA_SQL,
+        ensure_training_schema_mysql,
+    )
 
-    async with aiosqlite.connect(str(dst)) as db_dst:
-        await db_dst.executescript(TRAINING_SCHEMA_SQL)
-        await db_dst.commit()
+    if not _ensure_dst_schema_mysql(dst, ensure_training_schema_mysql):
+        async with aiosqlite.connect(str(dst)) as db_dst:
+            await db_dst.executescript(TRAINING_SCHEMA_SQL)
+            await db_dst.commit()
 
     tables = [
         "sketch_format_versions",
@@ -169,18 +214,17 @@ async def _merge_training_db(src: Path, dst: Path, dry_run: bool) -> dict[str, i
 
             # Determine column list dynamically (works with schema evolution)
             cols = list(rows[0].keys())
-            async with aiosqlite.connect(str(dst)) as db_dst:
-                placeholders = ",".join("?" for _ in cols)
-                col_list = ",".join(cols)
+            db_dst = await _open_dst_db(dst)
+            try:
+                ignore_sql = insert_ignore_sql(table, cols)
                 for row in rows:
                     values = [row[c] for c in cols]
                     # INSERT OR IGNORE: primary key conflicts are intentional
                     # (already migrated or duplicate across users)
-                    await db_dst.execute(
-                        f"INSERT OR IGNORE INTO {table} ({col_list}) VALUES ({placeholders})",
-                        values,
-                    )
+                    await db_dst.execute(ignore_sql, values)
                 await db_dst.commit()
+            finally:
+                await db_dst.close()
     return counts
 
 

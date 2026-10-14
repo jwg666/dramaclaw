@@ -44,12 +44,28 @@ def test_repository_ships_source_release_and_explicit_evidence_compose_files() -
 
 def test_compose_is_image_only_and_prefixed() -> None:
     services = _compose()["services"]
-    assert set(services) == {"api", "newapi", "web"}
+    assert set(services) == {"api", "mysql", "newapi", "web"}
     for name, service in services.items():
         assert "build" not in service, f"{name} must not carry a build block"
         assert "pull_policy" not in service, f"{name} must not set pull_policy"
+        if name == "mysql":
+            # 可选关系库:官方 mysql 镜像,profile 隔离,默认不随主套件启动
+            assert service["profiles"] == ["mysql"], name
+            assert service["image"].startswith("mysql:")
+            continue
         assert service["image"].startswith(IMAGE_PREFIX), name
         assert service.get("restart") == "unless-stopped", name
+
+
+def test_mysql_service_is_opt_in_with_persistent_volume_and_healthcheck() -> None:
+    mysql = _compose()["services"]["mysql"]
+    assert mysql["profiles"] == ["mysql"]
+    assert "mysql-data:/var/lib/mysql" in mysql["volumes"]
+    assert "healthcheck" in mysql
+    assert "--character-set-server=utf8mb4" in mysql["command"]
+    # 凭据可由 .env 覆盖,且有非空默认值(开箱可起)
+    assert mysql["environment"]["MYSQL_DATABASE"] == "${DRAMACLAW_MYSQL_DB:-dramaclaw}"
+    assert mysql["environment"]["MYSQL_PASSWORD"] == "${DRAMACLAW_MYSQL_PASSWORD:-dramaclaw}"
 
 
 def test_gateway_is_the_dramaclaw_fork_pinned_by_variable() -> None:
@@ -93,7 +109,8 @@ def test_api_provisioner_env_matches_desktop_contract() -> None:
     env = api["environment"]
     assert env["NEWAPI_BASE_URL"] == "${NEWAPI_BASE_URL:-" + OFFICIAL_GATEWAY_URL + "}"
     assert env["NEWAPI_ADMIN_BASE_URL"] == "http://newapi:3000"
-    assert env["NEWAPI_SQL_DSN"] == "local"
+    # 默认 local(内置 SQLite);网关切 MySQL 时经 .env 的 NEWAPI_SQL_DSN 指向同一 DSN
+    assert env["NEWAPI_SQL_DSN"] == "${NEWAPI_SQL_DSN:-local}"
     assert env["NEWAPI_SQLITE_PATH"] == "/newapi-data/one-api.db"
     assert env["NEWAPI_ADMIN_USERNAME"] == "root"
     assert env["NEWAPI_PROVISIONER_ENABLED"] == "${NEWAPI_PROVISIONER_ENABLED:-true}"
@@ -104,7 +121,8 @@ def test_api_provisioner_env_matches_desktop_contract() -> None:
 def test_gateway_shares_sqlite_volume_and_has_healthcheck() -> None:
     newapi = _compose()["services"]["newapi"]
     assert "newapi-data:/data" in newapi["volumes"]
-    assert newapi["environment"]["SQL_DSN"] == ""
+    # 默认空 = 内置 SQLite;.env 设 DRAMACLAW_GATEWAY_MYSQL_DSN 可切网关库到 MySQL
+    assert newapi["environment"]["SQL_DSN"] == "${DRAMACLAW_GATEWAY_MYSQL_DSN:-}"
     assert "healthcheck" in newapi
     assert "http://localhost:3000/api/status" in " ".join(newapi["healthcheck"]["test"])
 
@@ -118,7 +136,7 @@ def test_compose_pins_env_file_long_syntax_ports_and_volumes() -> None:
         "${ST_NEWAPI_BIND:-127.0.0.1}:${ST_NEWAPI_PORT:-3000}:3000"
     ]
     assert compose["services"]["web"]["ports"] == ["${ST_WEB_PORT:-8080}:80"]
-    assert set(compose["volumes"]) == {"ce-data", "newapi-data"}
+    assert set(compose["volumes"]) == {"ce-data", "newapi-data", "mysql-data"}
 
 
 def test_source_file_extends_release_and_builds_all_three() -> None:
@@ -151,7 +169,7 @@ def test_source_file_extends_release_and_builds_all_three() -> None:
     }
     assert services["web"]["build"] == {"context": "./frontend", "dockerfile": "Dockerfile"}
 
-    assert set(source["volumes"]) == {"ce-data", "newapi-data"}
+    assert set(source["volumes"]) == {"ce-data", "newapi-data", "mysql-data"}
 
 
 def test_source_file_never_mentions_release_versions() -> None:

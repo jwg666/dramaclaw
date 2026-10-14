@@ -31,6 +31,16 @@ from novelvideo.official_media_catalog_schema import (
     validate_official_media_catalog as _validate_official_media_catalog,
 )
 from novelvideo.shared.runtime_env import uses_local_ce_runtime
+from novelvideo.db.adapter import acquire_sync
+from novelvideo.db.dsn import scope_identity
+from novelvideo.db.schema_runner import ensure_mysql_schema
+from novelvideo.db.sql_compat import (
+    BACKEND_MYSQL,
+    active_backend,
+    immediate_tx_sync,
+    is_busy_error,
+    upsert_sql,
+)
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
 
 MODE_OFFICIAL = "official"
@@ -154,8 +164,33 @@ def _settings_db_path() -> Path:
     return Path(config.STATE_DIR) / "local" / "settings.db"
 
 
-def _connect() -> sqlite3.Connection:
+RUNTIME_SETTINGS_SCHEMA_COMPONENT = "runtime_settings"
+RUNTIME_SETTINGS_SCHEMA_VERSION = 1
+
+RUNTIME_SETTINGS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS runtime_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+
+def _connect():
     path = _settings_db_path()
+    if active_backend() == BACKEND_MYSQL:
+        # settings.db is a node-global scope (fixed g_settings__ prefix); the
+        # SQLite retry loop guards file contention that MySQL does not have,
+        # and lock serialization happens inside immediate_tx_sync (GET_LOCK).
+        key, relpath = scope_identity(path)
+        ensure_mysql_schema(
+            key,
+            component=RUNTIME_SETTINGS_SCHEMA_COMPONENT,
+            version=RUNTIME_SETTINGS_SCHEMA_VERSION,
+            ddl_scripts=[RUNTIME_SETTINGS_SCHEMA_SQL],
+            relpath=relpath,
+        )
+        return acquire_sync(key)
     path.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(3):
         conn: sqlite3.Connection | None = None
@@ -163,26 +198,13 @@ def _connect() -> sqlite3.Connection:
             conn = sqlite3.connect(str(path), timeout=10, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             configure_sqlite_connection(conn)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS runtime_settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """)
+            conn.execute(RUNTIME_SETTINGS_SCHEMA_SQL)
             conn.commit()
             return conn
         except sqlite3.OperationalError as exc:
             if conn is not None:
                 conn.close()
-            retryable = any(
-                marker in str(exc).lower()
-                for marker in (
-                    "disk i/o error",
-                    "database is locked",
-                    "database is busy",
-                )
-            )
+            retryable = is_busy_error(exc) or "disk i/o error" in str(exc).lower()
             if not retryable or attempt == 2:
                 raise
             time.sleep(0.05 * (attempt + 1))
@@ -196,7 +218,8 @@ def _connect() -> sqlite3.Connection:
 def _read_all() -> dict[str, str]:
     conn = _connect()
     try:
-        rows = conn.execute("SELECT key, value FROM runtime_settings").fetchall()
+        # `key` 是 MySQL 保留字,反引号引用(SQLite 同样接受反引号标识符)。
+        rows = conn.execute("SELECT `key`, value FROM runtime_settings").fetchall()
         return {str(row["key"]): str(row["value"]) for row in rows}
     finally:
         conn.close()
@@ -211,22 +234,16 @@ def _write_many(values: dict[str, str]) -> None:
     now = _now_iso()
     conn = _connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        for key, value in values.items():
-            conn.execute(
-                """
-                INSERT INTO runtime_settings(key, value, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value,
-                    updated_at = excluded.updated_at
-                """,
-                (key, str(value or ""), now),
-            )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+        with immediate_tx_sync(conn, lock="runtime_settings:write"):
+            for key, value in values.items():
+                conn.execute(
+                    upsert_sql(
+                        "runtime_settings",
+                        ("`key`",),
+                        ("`key`", "value", "updated_at"),
+                    ),
+                    (key, str(value or ""), now),
+                )
     finally:
         conn.close()
 

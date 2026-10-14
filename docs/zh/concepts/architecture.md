@@ -71,7 +71,7 @@ CE 固定**单本地用户**，项目数据全部在本地：
 - `state/<user>/<project>/data.db`（SQLite）—— 项目结构化数据
 - `output/<user>/<project>/...` —— 成片与素材
 
-不依赖任何外部数据库。
+默认不依赖任何外部数据库。需要集中化部署时,配置 `NOVELVIDEO_DB_DSN`(`mysql://…`)即可把全部自研存储切换到 MySQL 8(`db/` 兼容层:同一套 SQL 按 DSN 渲染 SQLite/MySQL 方言,每个原 SQLite 文件映射为单库内一个表名前缀,历史数据用 `scripts/migrate_sqlite_to_mysql.py` 一次性导入);不配置则行为不变。
 
 ## 模型接入
 

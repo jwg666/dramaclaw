@@ -36,6 +36,15 @@ from novelvideo.i18n_message import (
 )
 
 from novelvideo.config import OUTPUT_DIR, STATE_DIR
+from novelvideo.db.sql_compat import (
+    BACKEND_MYSQL,
+    active_backend,
+    immediate_tx_sync,
+    json_extract_text,
+    json_valid_expr,
+    table_columns_sync,
+    upsert_sql,
+)
 from novelvideo.project_context import ProjectContext, require_project_home_node
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
 from novelvideo.sqlite_schema import ensure_sqlite_schema
@@ -381,6 +390,10 @@ class TaskStateManager:
 
     @contextmanager
     def _connect_path(self, db_path: Path, *, skip_auto_sweep: bool = False):
+        if active_backend() == BACKEND_MYSQL:
+            with self._connect_path_mysql(db_path, skip_auto_sweep=skip_auto_sweep) as conn:
+                yield conn
+            return
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_task_schema(db_path)
         conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
@@ -397,6 +410,25 @@ class TaskStateManager:
         finally:
             conn.close()
 
+    @contextmanager
+    def _connect_path_mysql(self, db_path: Path, *, skip_auto_sweep: bool = False):
+        """MySQL 后端的连接上下文(线程本地连接复用)。"""
+
+        from novelvideo.db.adapter import acquire_sync
+        from novelvideo.db.dsn import scope_identity
+
+        self._ensure_task_schema_mysql(db_path)
+        scope_key, relpath = scope_identity(db_path)
+        conn = acquire_sync(scope_key)
+        if not skip_auto_sweep:
+            self._sweep_interrupted_inline_tasks_once(conn, db_path)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            # 线程本地缓存连接不真正关闭(adapter 内部回收)
+            pass
+
     @staticmethod
     def _ensure_task_schema(db_path: Path) -> None:
         """Initialize/upgrade task tables once, serialized across processes."""
@@ -404,10 +436,7 @@ class TaskStateManager:
         def initialize(conn: sqlite3.Connection) -> None:
             conn.row_factory = sqlite3.Row
             conn.executescript(_TASK_STATE_SCHEMA_SQL)
-            existing_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(task_states)").fetchall()
-            }
+            existing_columns = set(table_columns_sync(conn, "task_states"))
             for column, sql in _TASK_STATE_COLUMN_UPGRADES.items():
                 if column not in existing_columns:
                     conn.execute(sql)
@@ -425,6 +454,33 @@ class TaskStateManager:
             component=_TASK_STATE_SCHEMA_COMPONENT,
             version=_TASK_STATE_SCHEMA_VERSION,
             initialize=initialize,
+        )
+
+    _TASK_STATE_INDEX_DDL = (
+        "CREATE INDEX IF NOT EXISTS idx_task_states_project_updated "
+        "ON task_states(project_id, updated_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_task_states_project_queue_status "
+        "ON task_states(project_id, queue_kind, status);"
+    )
+
+    def _ensure_task_schema_mysql(self, db_path: Path) -> None:
+        """MySQL 后端的 task_states schema 迁移。"""
+
+        from novelvideo.db.dsn import scope_identity
+        from novelvideo.db.schema_runner import ensure_mysql_schema
+
+        upgrades = []
+        for column, sql in _TASK_STATE_COLUMN_UPGRADES.items():
+            definition = sql.split(" ADD COLUMN ", 1)[1]
+            upgrades.append(("task_states", column, definition))
+        ensure_mysql_schema(
+            scope_identity(db_path)[0],
+            component=_TASK_STATE_SCHEMA_COMPONENT,
+            version=_TASK_STATE_SCHEMA_VERSION,
+            # 表与索引必须同一脚本翻译:索引列收集是按脚本扫描的
+            ddl_scripts=[_TASK_STATE_SCHEMA_SQL + self._TASK_STATE_INDEX_DDL],
+            column_upgrades=upgrades,
+            relpath=scope_identity(db_path)[1],
         )
 
     @contextmanager
@@ -520,6 +576,8 @@ class TaskStateManager:
 
     @staticmethod
     def _list_project_db_paths(username: str) -> list[Path]:
+        if active_backend() == BACKEND_MYSQL:
+            return TaskStateManager._list_project_db_paths_mysql(username)
         project_db_paths: dict[str, Path] = {}
         for user_dir in (
             (Path(STATE_DIR) / username).resolve(),
@@ -537,6 +595,34 @@ class TaskStateManager:
                 if db_path.exists():
                     project_db_paths[project_name] = db_path
         return sorted(project_db_paths.values())
+
+    @staticmethod
+    def _list_project_db_paths_mysql(username: str) -> list[Path]:
+        """MySQL 后端:项目清单来自 mv_scopes 登记表(没有文件系统可扫)。"""
+
+        from novelvideo.db.adapter import acquire_sync
+
+        registry_scope = "g_registry__"
+        conn = acquire_sync(registry_scope)
+        cur = conn._raw.cursor()
+        try:
+            cur.execute(
+                "SELECT relpath FROM mv_scopes WHERE relpath LIKE %s AND relpath LIKE %s "
+                "ORDER BY relpath",
+                (f"{username}/%/data.db", "%/data.db"),
+            )
+            relpaths = [row[0] for row in cur.fetchall()]
+        finally:
+            cur.close()
+        # 还原为伪路径:_connect(username, project) 会按同名规则重建 scope
+        paths: dict[str, Path] = {}
+        for rel in relpaths:
+            parts = rel.split("/")
+            if len(parts) != 3:
+                continue
+            project_name = parts[1]
+            paths.setdefault(project_name, Path(STATE_DIR) / rel)
+        return sorted(paths.values())
 
     def create_task(
         self,
@@ -656,8 +742,9 @@ class TaskStateManager:
 
         normalized_queue_kind = normalize_queue_kind(queue_kind)
         now = utc_now_iso()
-        with self._connect_context(ctx) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._connect_context(ctx) as conn, immediate_tx_sync(
+            conn, lock=f"task_states:{ctx.project_id}"
+        ):
             row = conn.execute(
                 "SELECT * FROM task_states WHERE task_key = ? AND project_id = ?",
                 (task_key, ctx.project_id),
@@ -762,8 +849,9 @@ class TaskStateManager:
             beat_num=beat_num,
             scope=scope,
         )
-        with self._connect_context(ctx) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._connect_context(ctx) as conn, immediate_tx_sync(
+            conn, lock=f"task_states:{ctx.project_id}"
+        ):
             row = conn.execute(
                 "SELECT * FROM task_states WHERE task_key = ? AND project_id = ?",
                 (task_key, ctx.project_id),
@@ -810,8 +898,9 @@ class TaskStateManager:
             beat_num=beat_num,
             scope=scope,
         )
-        with self._connect_context(ctx) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._connect_context(ctx) as conn, immediate_tx_sync(
+            conn, lock=f"task_states:{ctx.project_id}"
+        ):
             row = conn.execute(
                 "SELECT * FROM task_states WHERE task_key = ? AND project_id = ?",
                 (task_key, ctx.project_id),
@@ -860,8 +949,9 @@ class TaskStateManager:
             beat_num=beat_num,
             scope=scope,
         )
-        with self._connect_context(ctx) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._connect_context(ctx) as conn, immediate_tx_sync(
+            conn, lock=f"task_states:{ctx.project_id}"
+        ):
             row = conn.execute(
                 "SELECT * FROM task_states WHERE task_key = ? AND project_id = ?",
                 (task_key, ctx.project_id),
@@ -1368,9 +1458,9 @@ class TaskStateManager:
                 "error = COALESCE(NULLIF(error, ''), ?), "
                 "completed_at = ?, updated_at = ?, expires_at = ? "
                 "WHERE status IN ('submitting', 'queued', 'running') "
-                "AND updated_at < ? "
-                "AND json_valid(result_json) "
-                "AND json_extract(result_json, '$.task_metadata.backend') = 'inline'",
+                f"AND updated_at < ? "
+                f"AND {json_valid_expr('result_json')} "
+                f"AND {json_extract_text('result_json', '$.task_metadata.backend')} = 'inline'",
                 (
                     "服务重启,任务已中断,请重新发起",
                     now,
@@ -1384,9 +1474,9 @@ class TaskStateManager:
                 "error = COALESCE(NULLIF(error, ''), ?), "
                 "completed_at = ?, updated_at = ?, expires_at = ? "
                 "WHERE status IN ('submitting', 'queued', 'running') "
-                "AND updated_at < ? "
-                "AND json_valid(result_json) "
-                "AND json_extract(result_json, '$.task_metadata.backend') = 'celery'",
+                f"AND updated_at < ? "
+                f"AND {json_valid_expr('result_json')} "
+                f"AND {json_extract_text('result_json', '$.task_metadata.backend')} = 'celery'",
                 (
                     "任务超时未更新,worker 已中断,请重新发起",
                     now,
@@ -1396,7 +1486,9 @@ class TaskStateManager:
                 ),
             )
             conn.commit()
-        except sqlite3.OperationalError as exc:
+        except Exception as exc:
+            # 尽力而为的清扫:锁等待/连接抖动(MySQL 1205/超时)或 SQLite busy
+            # 都按跳过处理,留给下次连接重试。其余错误同样只告警不阻断主流程。
             conn.rollback()
             logger.warning("stale task sweep skipped: %s", exc)
             return None
@@ -1680,36 +1772,17 @@ class TaskStateManager:
         # LocalizableMessage 都是这么没的，英文界面因此还是渲染中文兜底。
         result = TaskStateManager._merge_metadata_into_result(state.result, state.metadata)
         conn.execute(
-            """
-            INSERT INTO task_states (
-                task_key, task_id, task_type, queue_kind, project_id, requester_user_id,
-                owner_username, project_name, username, project, episode, beat_num,
-                status, progress, current_task, result_json, error, logs_json,
-                created_at, updated_at, completed_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(task_key) DO UPDATE SET
-                task_id = excluded.task_id,
-                task_type = excluded.task_type,
-                queue_kind = excluded.queue_kind,
-                project_id = excluded.project_id,
-                requester_user_id = excluded.requester_user_id,
-                owner_username = excluded.owner_username,
-                project_name = excluded.project_name,
-                username = excluded.username,
-                project = excluded.project,
-                episode = excluded.episode,
-                beat_num = excluded.beat_num,
-                status = excluded.status,
-                progress = excluded.progress,
-                current_task = excluded.current_task,
-                result_json = excluded.result_json,
-                error = excluded.error,
-                logs_json = excluded.logs_json,
-                created_at = excluded.created_at,
-                updated_at = excluded.updated_at,
-                completed_at = excluded.completed_at,
-                expires_at = excluded.expires_at
-            """,
+            upsert_sql(
+                "task_states",
+                ("task_key",),
+                (
+                    "task_key", "task_id", "task_type", "queue_kind", "project_id",
+                    "requester_user_id", "owner_username", "project_name",
+                    "username", "project", "episode", "beat_num", "status",
+                    "progress", "current_task", "result_json", "error", "logs_json",
+                    "created_at", "updated_at", "completed_at", "expires_at",
+                ),
+            ),
             (
                 task_key,
                 state.task_id,

@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from novelvideo.config import OUTPUT_DIR, STATE_DIR
+from novelvideo.db.sql_compat import BACKEND_MYSQL, active_backend, insert_do_nothing_sql
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
 from novelvideo.sqlite_schema import ensure_sqlite_schema
 
@@ -98,6 +99,28 @@ def infer_episode_from_path(path_like: str | Path | None) -> int | None:
 @contextmanager
 def _connect(project_output_dir: str | Path):
     db_path = get_image_request_usage_db_path(project_output_dir)
+    if active_backend() == BACKEND_MYSQL:
+        # 与项目 data.db 同一逻辑库(表名前缀);schema 走迁移台账
+        from novelvideo.db.adapter import acquire_sync
+        from novelvideo.db.dsn import scope_identity
+        from novelvideo.db.schema_runner import ensure_mysql_schema
+
+        key, relpath = scope_identity(db_path)
+        ensure_mysql_schema(
+            key,
+            component=_SCHEMA_COMPONENT,
+            version=_SCHEMA_VERSION,
+            ddl_scripts=[_SCHEMA_SQL],
+            relpath=relpath,
+        )
+        conn = acquire_sync(key)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            # 线程本地缓存连接,close() 归属 adapter,不真正断开
+            conn.close()
+        return
     db_path.parent.mkdir(parents=True, exist_ok=True)
     ensure_sqlite_schema(
         db_path,
@@ -130,14 +153,15 @@ def record_image_request(
     now = datetime.now().isoformat()
     with _connect(project_output_dir) as conn:
         conn.execute(
-            """
-            INSERT INTO image_request_usage (
-                request_id, provider, model_name, task_type, scope,
-                episode, beat_num, character_name, identity_name,
-                status, accepted_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)
-            ON CONFLICT(request_id) DO NOTHING
-            """,
+            insert_do_nothing_sql(
+                "image_request_usage",
+                (
+                    "request_id", "provider", "model_name", "task_type", "scope",
+                    "episode", "beat_num", "character_name", "identity_name",
+                    "status", "accepted_at", "updated_at",
+                ),
+                ("request_id",),
+            ),
             (
                 request_id,
                 provider,
@@ -148,6 +172,7 @@ def record_image_request(
                 beat_num,
                 character_name,
                 identity_name,
+                "accepted",
                 now,
                 now,
             ),

@@ -9,6 +9,20 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from novelvideo.db.adapter import acquire_sync
+from novelvideo.db.dsn import scope_identity
+from novelvideo.db.schema_runner import ensure_mysql_schema
+from novelvideo.db.sql_compat import (
+    BACKEND_MYSQL,
+    active_backend,
+    upsert_sql,
+)
+from novelvideo.chat.store import (
+    CHAT_DB_COLUMN_UPGRADES,
+    CHAT_DB_SCHEMA_COMPONENT,
+    CHAT_DB_SCHEMA_SQL,
+    CHAT_DB_SCHEMA_VERSION,
+)
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
 
 
@@ -38,7 +52,30 @@ def migrate_legacy_chat_db(
         pass
 
 
-def connect(db_path: Path) -> sqlite3.Connection:
+def connect(db_path: Path):
+    """Open the legacy project chat DB on the active storage backend.
+
+    The legacy database targets the same ``chat.db`` file as
+    :mod:`novelvideo.chat.store`, so on MySQL both modules must agree on one
+    canonical schema: whoever ensures the scope first creates the full table
+    set (including the ``turn_id``/``metadata_json``/``idempotency_key``
+    columns the legacy writer never uses) and the other ensure is a cached
+    no-op. Ensuring only this module's narrower five-column script here would
+    race ``chat.store``'s partial index creation against a missing
+    ``idempotency_key`` column.
+    """
+
+    if active_backend() == BACKEND_MYSQL:
+        key, relpath = scope_identity(db_path)
+        ensure_mysql_schema(
+            key,
+            component=CHAT_DB_SCHEMA_COMPONENT,
+            version=CHAT_DB_SCHEMA_VERSION,
+            ddl_scripts=[CHAT_DB_SCHEMA_SQL],
+            column_upgrades=CHAT_DB_COLUMN_UPGRADES,
+            relpath=relpath,
+        )
+        return acquire_sync(key)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -100,8 +137,9 @@ def save_chat_input_history(
 
 
 def get_setting(conn: sqlite3.Connection, key: str) -> str | None:
+    # `key` 是 MySQL 保留字,反引号引用(SQLite 同样接受反引号标识符)。
     row = conn.execute(
-        "SELECT value FROM chat_settings WHERE key = ?", (key,)
+        "SELECT value FROM chat_settings WHERE `key` = ?", (key,)
     ).fetchone()
     return str(row["value"]) if row else None
 
@@ -114,13 +152,11 @@ def set_setting(
     now_iso: Callable[[], str],
 ) -> None:
     conn.execute(
-        """
-        INSERT INTO chat_settings(key, value, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET
-          value = excluded.value,
-          updated_at = excluded.updated_at
-        """,
+        upsert_sql(
+            "chat_settings",
+            ("`key`",),
+            ("`key`", "value", "updated_at"),
+        ),
         (key, value, now_iso()),
     )
     conn.commit()
@@ -191,6 +227,7 @@ def history_contents(conn: sqlite3.Connection, role: str, *, limit: int) -> list
 
 
 def recent_messages(conn: sqlite3.Connection, *, limit: int) -> list[sqlite3.Row]:
+    # 派生表带别名:MySQL 要求 FROM 子查询必须有别名(SQLite 两者皆可)。
     return conn.execute(
         """
         SELECT id, role, content, media_json, created_at
@@ -200,7 +237,7 @@ def recent_messages(conn: sqlite3.Connection, *, limit: int) -> list[sqlite3.Row
                  WHERE role <> 'trace'
                  ORDER BY id DESC
                  LIMIT ?
-               )
+               ) AS recent_messages
          ORDER BY id ASC
         """,
         (max(1, int(limit)),),

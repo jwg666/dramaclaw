@@ -24,11 +24,19 @@ the shared artifact store; `record_*` helpers enforce ordering.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any, Iterable
 
 import aiosqlite
 
+from novelvideo.db.sql_compat import (
+    BACKEND_MYSQL,
+    active_backend,
+    replace_into_sql,
+    upsert_sql,
+    utc_datetime_str,
+)
 from novelvideo.sqlite_pragmas import configure_sqlite_connection_async
 
 
@@ -134,10 +142,44 @@ CREATE TABLE IF NOT EXISTS human_override_events (
 CREATE INDEX IF NOT EXISTS idx_events_trace ON human_override_events(trace_id);
 """
 
+_TRAINING_SCHEMA_COMPONENT = "director_training"
+# MIGRATION CONTRACT: increment this whenever TRAINING_SCHEMA_SQL changes.
+_TRAINING_SCHEMA_VERSION = 1
 
-async def open_training_db(db_path: Path) -> aiosqlite.Connection:
+
+def ensure_training_schema_mysql(db_path: Path) -> None:
+    """MySQL 后端:在 director_training.db 逻辑库(g_training__ 作用域)上
+    确保训练数据五表 schema(阻塞,建议在 to_thread 中调用)。"""
+
+    from novelvideo.db.dsn import scope_identity
+    from novelvideo.db.schema_runner import ensure_mysql_schema
+
+    key, relpath = scope_identity(db_path)
+    ensure_mysql_schema(
+        key,
+        component=_TRAINING_SCHEMA_COMPONENT,
+        version=_TRAINING_SCHEMA_VERSION,
+        ddl_scripts=[TRAINING_SCHEMA_SQL],
+        relpath=relpath,
+    )
+
+
+async def open_training_db(db_path: Path):
+    """Open (or create) the shared training DB.
+
+    On SQLite returns an aiosqlite connection; on MySQL returns an
+    adapter async connection (same execute/commit/close surface).
+    Callers are responsible for closing the connection.
+    """
     db_path = Path(db_path).expanduser()
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    if active_backend() == BACKEND_MYSQL:
+        from novelvideo.db.adapter import acquire_async
+        from novelvideo.db.dsn import scope_identity
+
+        await asyncio.to_thread(ensure_training_schema_mysql, db_path)
+        key, _relpath = scope_identity(db_path)
+        return await acquire_async(key)
     db = await aiosqlite.connect(str(db_path))
     db.row_factory = aiosqlite.Row
     await configure_sqlite_connection_async(db)
@@ -160,14 +202,16 @@ async def ensure_sketch_format_seeded(
     record its path here.
     """
     await db.execute(
-        """
-        INSERT INTO sketch_format_versions (version, description, style_lock_artifact_path, created_at)
-        VALUES (?, ?, ?, datetime('now'))
-        ON CONFLICT(version) DO UPDATE SET
-            description = excluded.description,
-            style_lock_artifact_path = excluded.style_lock_artifact_path
-        """,
-        (version, description, style_lock_artifact_path),
+        upsert_sql(
+            "sketch_format_versions",
+            ("version",),
+            ("version", "description", "style_lock_artifact_path", "created_at"),
+            set_sql=(
+                "description = excluded.description, "
+                "style_lock_artifact_path = excluded.style_lock_artifact_path"
+            ),
+        ),
+        (version, description, style_lock_artifact_path, utc_datetime_str()),
     )
     await db.commit()
 
@@ -189,10 +233,9 @@ async def insert_accepted_sample(
         "sketch_artifact_path", "sketch_sha256",
         "observed_by_current_gate", "observed_gate_registry_version",
     ]
-    placeholders = ",".join("?" for _ in columns)
     values = [row.get(col) for col in columns]
     await db.execute(
-        f"INSERT OR REPLACE INTO accepted_sketch_samples ({','.join(columns)}) VALUES ({placeholders})",
+        replace_into_sql("accepted_sketch_samples", columns),
         values,
     )
     await db.commit()
@@ -275,8 +318,8 @@ async def finalize_trace(
     set_clause = ", ".join(f"{col} = ?" for col in cols)
     params = [payload[col] for col in cols]
     await db.execute(
-        f"UPDATE live_edit_traces SET {set_clause}, completed_at = datetime('now') WHERE trace_id = ?",
-        (*params, trace_id),
+        f"UPDATE live_edit_traces SET {set_clause}, completed_at = ? WHERE trace_id = ?",
+        (*params, utc_datetime_str(), trace_id),
     )
     await db.commit()
 

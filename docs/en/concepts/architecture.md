@@ -71,7 +71,7 @@ CE is fixed to a **single local user**, and all project data stays local:
 - `state/<user>/<project>/data.db` (SQLite) — structured project data
 - `output/<user>/<project>/...` — finished videos and assets
 
-No external database is required.
+No external database is required by default. For centralized deployments, set `NOVELVIDEO_DB_DSN` (`mysql://…`) to move all application-owned storage to MySQL 8 (the `db/` compatibility layer renders the same SQL for SQLite/MySQL dialects; each former SQLite file maps to a table-name prefix inside one database; import historical data once with `scripts/migrate_sqlite_to_mysql.py`). Without the DSN, behavior is unchanged.
 
 ## Model Access
 

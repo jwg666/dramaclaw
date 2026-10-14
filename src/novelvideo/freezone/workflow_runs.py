@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from novelvideo.db.sql_compat import immediate_tx_sync, table_columns_sync, upsert_sql
 from novelvideo.freezone.paths import CANVAS_ID_RE
 from novelvideo.freezone.workflow_contract_generated import GENERATION_ACTION_TYPES
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
@@ -369,10 +370,7 @@ def _connect(project_dir: Path):
             if db_path not in _SCHEMA_READY_PATHS:
                 configure_sqlite_connection(conn)
                 conn.executescript(WORKFLOW_RUN_SCHEMA_SQL)
-                columns = {
-                    str(row[1])
-                    for row in conn.execute("PRAGMA table_info(workflow_run_actions)")
-                }
+                columns = set(table_columns_sync(conn, "workflow_run_actions"))
                 for column in (
                     "recipe_id",
                     "recipe_version",
@@ -499,23 +497,27 @@ def _write_run(conn: sqlite3.Connection, payload: dict[str, Any]) -> None:
     metadata = metadata if isinstance(metadata, dict) else {}
     idempotency_key = str(metadata.get("idempotency_key") or "").strip() or None
     conn.execute(
-        """
-        INSERT INTO workflow_runs (
-            run_id, schema_version, project_id, canvas_id, status, resumable,
-            actor_id, runner_id, lease_expires_at, idempotency_key, metadata_json,
-            created_at, started_at, updated_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(run_id) DO UPDATE SET
-            status = excluded.status,
-            resumable = excluded.resumable,
-            actor_id = excluded.actor_id,
-            runner_id = excluded.runner_id,
-            lease_expires_at = excluded.lease_expires_at,
-            idempotency_key = excluded.idempotency_key,
-            metadata_json = excluded.metadata_json,
-            updated_at = excluded.updated_at,
-            completed_at = excluded.completed_at
-        """,
+        upsert_sql(
+            "workflow_runs",
+            ("run_id",),
+            (
+                "run_id", "schema_version", "project_id", "canvas_id", "status",
+                "resumable", "actor_id", "runner_id", "lease_expires_at",
+                "idempotency_key", "metadata_json", "created_at", "started_at",
+                "updated_at", "completed_at",
+            ),
+            set_sql=(
+                "status = excluded.status, "
+                "resumable = excluded.resumable, "
+                "actor_id = excluded.actor_id, "
+                "runner_id = excluded.runner_id, "
+                "lease_expires_at = excluded.lease_expires_at, "
+                "idempotency_key = excluded.idempotency_key, "
+                "metadata_json = excluded.metadata_json, "
+                "updated_at = excluded.updated_at, "
+                "completed_at = excluded.completed_at"
+            ),
+        ),
         (
             payload["run_id"],
             payload["schema_version"],
@@ -536,38 +538,20 @@ def _write_run(conn: sqlite3.Connection, payload: dict[str, Any]) -> None:
     )
     for sequence_no, item in enumerate(payload.get("actions") or []):
         conn.execute(
-            """
-            INSERT INTO workflow_run_actions (
-                run_id, node_id, action, sequence_no, status, phase, updated_at,
-                error, error_category, retryable, error_request_id,
-                error_fingerprint, user_error, task_key, task_type, job_id,
-                retry_count, artifact_status, recipe_id, recipe_version,
-                generation_attempt_id, product_operation_id,
-                media_request_fingerprint, media_claimed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(run_id, node_id, action) DO UPDATE SET
-                sequence_no = excluded.sequence_no,
-                status = excluded.status,
-                phase = excluded.phase,
-                updated_at = excluded.updated_at,
-                error = excluded.error,
-                error_category = excluded.error_category,
-                retryable = excluded.retryable,
-                error_request_id = excluded.error_request_id,
-                error_fingerprint = excluded.error_fingerprint,
-                user_error = excluded.user_error,
-                task_key = excluded.task_key,
-                task_type = excluded.task_type,
-                job_id = excluded.job_id,
-                retry_count = excluded.retry_count,
-                artifact_status = excluded.artifact_status
-                ,recipe_id = excluded.recipe_id
-                ,recipe_version = excluded.recipe_version
-                ,generation_attempt_id = excluded.generation_attempt_id
-                ,product_operation_id = excluded.product_operation_id
-                ,media_request_fingerprint = excluded.media_request_fingerprint
-                ,media_claimed_at = excluded.media_claimed_at
-            """,
+            upsert_sql(
+                "workflow_run_actions",
+                ("run_id", "node_id", "action"),
+                (
+                    "run_id", "node_id", "action", "sequence_no", "status",
+                    "phase", "updated_at", "error", "error_category",
+                    "retryable", "error_request_id", "error_fingerprint",
+                    "user_error", "task_key", "task_type", "job_id",
+                    "retry_count", "artifact_status", "recipe_id",
+                    "recipe_version", "generation_attempt_id",
+                    "product_operation_id", "media_request_fingerprint",
+                    "media_claimed_at",
+                ),
+            ),
             (
                 payload["run_id"],
                 item["node_id"],
@@ -700,8 +684,9 @@ def bind_workflow_action_product_operation(
     operation_id: str,
 ) -> dict[str, Any]:
     _validate_scope(canvas_id, run_id)
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_run_actions:{run_id}:{node_id}:{action}"
+    ):
         current = conn.execute(
             """
             SELECT product_operation_id FROM workflow_run_actions
@@ -754,8 +739,9 @@ def claim_workflow_media_action(
     }
     if task_type not in allowed_actions or len(fingerprint) != 64:
         raise ValueError("invalid workflow media claim")
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_run_actions:{operation_id}:{node_id}:{attempt_id}"
+    ):
         operation = conn.execute(
             "SELECT * FROM freezone_agent_product_operations WHERE operation_id = ?",
             (operation_id,),
@@ -885,8 +871,9 @@ def bind_workflow_media_task(
     task_type: str,
     task_key: str,
 ) -> None:
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_run_actions:{operation_id}:{job_id}"
+    ):
         current = conn.execute(
             """SELECT task_key FROM workflow_run_actions
                WHERE run_id = ? AND node_id = ? AND product_operation_id = ?
@@ -913,8 +900,9 @@ def renew_workflow_media_claim(
     claimed_at: float,
 ) -> bool:
     """Give one caller ownership of a stale claim whose task was never reserved."""
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_run_actions:{operation_id}:{job_id}"
+    ):
         updated = conn.execute(
             """UPDATE workflow_run_actions SET media_claimed_at = ?
                WHERE run_id = ? AND node_id = ? AND product_operation_id = ?
@@ -951,8 +939,9 @@ def reclaim_failed_workflow_media_action(
     """
     from novelvideo.task_state import project_task_state_key
 
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_run_actions:{operation_id}:{attempt_id}"
+    ):
         action = conn.execute(
             """SELECT a.* FROM workflow_run_actions AS a
                  JOIN workflow_runs AS r ON r.run_id = a.run_id
@@ -1045,8 +1034,9 @@ def create_workflow_run(
         "actions": normalized_actions,
         "metadata": run_metadata,
     }
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_runs:{canvas_id}"
+    ):
         if checked_idempotency_key:
             existing_row = conn.execute(
                 """
@@ -1126,8 +1116,9 @@ def reconcile_workflow_runs_with_canvas_nodes(
     now = _now()
     cancelled: list[str] = []
     eligible_statuses = run_statuses or RESUMABLE_RUN_STATUSES
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_runs:{canvas_id}"
+    ):
         for payload in _list_runs_in_transaction(
             conn,
             canvas_id=canvas_id,
@@ -1196,8 +1187,9 @@ def reconcile_workflow_runs_with_canvas_results(
     }
     timestamp = _now()
     changed_run_ids: list[str] = []
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_runs:{canvas_id}"
+    ):
         for payload in _list_runs_in_transaction(
             conn,
             canvas_id=canvas_id,
@@ -1269,8 +1261,9 @@ def interrupt_stale_workflow_runs(
     current = now or datetime.now(timezone.utc)
     cutoff = current - timedelta(seconds=max(stale_after_seconds, 1))
     interrupted: list[str] = []
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_runs:{canvas_id}"
+    ):
         for payload in _list_runs_in_transaction(
             conn,
             canvas_id=canvas_id,
@@ -1328,8 +1321,9 @@ def prune_workflow_runs(
     current = now or datetime.now(timezone.utc)
     cutoff = current - timedelta(days=max(retention_days, 1))
     removable: list[tuple[dict[str, Any], datetime]] = []
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_runs:{canvas_id}"
+    ):
         for payload in _list_runs_in_transaction(
             conn,
             canvas_id=canvas_id,
@@ -1368,8 +1362,9 @@ def update_workflow_run(
     checked_runner_id = runner_id.strip()
     if checked_runner_id and not RUNNER_ID_RE.match(checked_runner_id):
         raise ValueError("invalid workflow run runner_id")
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_runs:{canvas_id}:{run_id}"
+    ):
         payload = _read_run(conn, canvas_id=canvas_id, run_id=run_id)
         if payload is None:
             return None
@@ -1586,8 +1581,9 @@ def reconcile_workflow_runs_with_tasks(
 
     changed_run_ids: list[str] = []
     timestamp = _now()
-    with _connect(project_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _connect(project_dir) as conn, immediate_tx_sync(
+        conn, lock=f"workflow_runs:{canvas_id}"
+    ):
         for payload in _list_runs_in_transaction(conn, canvas_id=canvas_id):
             if payload.get("status") == "cancelled":
                 continue

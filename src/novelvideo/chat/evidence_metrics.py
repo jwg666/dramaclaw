@@ -18,10 +18,31 @@ import os
 import sqlite3
 import threading
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
+
+from novelvideo.db.adapter import acquire_sync
+from novelvideo.db.dsn import scope_identity
+from novelvideo.db.schema_runner import ensure_mysql_schema
+from novelvideo.db.sql_compat import (
+    BACKEND_MYSQL,
+    active_backend,
+    upsert_sql,
+)
 
 _lock = threading.Lock()
 _counts: Counter[str] = Counter()
+
+EVIDENCE_METRICS_SCHEMA_COMPONENT = "evidence_metrics"
+EVIDENCE_METRICS_SCHEMA_VERSION = 1
+
+EVIDENCE_COUNTERS_DDL = """
+CREATE TABLE IF NOT EXISTS evidence_counters (
+    outcome TEXT PRIMARY KEY,
+    count INTEGER NOT NULL CHECK (count >= 0),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"""
 
 
 def _persistent_db_path() -> Path | None:
@@ -34,21 +55,42 @@ def _persistent_db_path() -> Path | None:
     return Path(state_dir).expanduser() / "_shared" / "diagnostics" / "evidence_metrics.sqlite3"
 
 
-def _connect(path: Path) -> sqlite3.Connection:
+@contextmanager
+def _connect(path: Path):
+    """Backend-aware connection scope.
+
+    Keeps the exact call shape ``with _connect(path) as conn`` — on SQLite
+    that previously went through ``sqlite3.Connection.__enter__`` (commit on
+    exit, rollback on error), which the MySQL shim does not implement, so the
+    commit/rollback is spelled out here. SQLite-only pragmas (busy_timeout,
+    journal_mode) never run on a MySQL connection.
+    """
+
+    if active_backend() == BACKEND_MYSQL:
+        key, relpath = scope_identity(path)
+        ensure_mysql_schema(
+            key,
+            component=EVIDENCE_METRICS_SCHEMA_COMPONENT,
+            version=EVIDENCE_METRICS_SCHEMA_VERSION,
+            ddl_scripts=[EVIDENCE_COUNTERS_DDL],
+            relpath=relpath,
+        )
+        conn = acquire_sync(key)
+        try:
+            yield conn
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=5)
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS evidence_counters (
-            outcome TEXT PRIMARY KEY,
-            count INTEGER NOT NULL CHECK (count >= 0),
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    return conn
+    conn.execute(EVIDENCE_COUNTERS_DDL)
+    with conn:
+        yield conn
 
 #: Outcomes that must stay at zero. Each means a turn either produced evidence
 #: that cannot be trusted, or tried to leave for somewhere it had no business
@@ -78,15 +120,19 @@ def observe(outcome: str) -> None:
             _counts[name] += 1
             return
         with _connect(path) as conn:
+            # Raw SET clause: the increment must read the *existing* row value,
+            # not the conflicting one (excluded.count would be the seeded 1).
             conn.execute(
-                """
-                INSERT INTO evidence_counters(outcome, count)
-                VALUES (?, 1)
-                ON CONFLICT(outcome) DO UPDATE SET
-                    count = evidence_counters.count + 1,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (name,),
+                upsert_sql(
+                    "evidence_counters",
+                    ("outcome",),
+                    ("outcome", "count"),
+                    set_sql=(
+                        "count = evidence_counters.count + 1, "
+                        "updated_at = CURRENT_TIMESTAMP"
+                    ),
+                ),
+                (name, 1),
             )
 
 

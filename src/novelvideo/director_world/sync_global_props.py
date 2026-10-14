@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from novelvideo.db.sql_compat import BACKEND_MYSQL, active_backend, upsert_sql, utc_datetime_str
 from novelvideo.models import build_prop_menu
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
 from novelvideo.sqlite_schema import ensure_sqlite_schema
@@ -17,6 +18,22 @@ from novelvideo.utils.project_paths import ProjectPaths
 _SCHEMA_COMPONENT = "director_world_props"
 # MIGRATION CONTRACT: increment this whenever _ensure_props_table changes.
 _SCHEMA_VERSION = 1
+
+# props 表的建表语句(SQLite/MySQL 双后端共用一份 SQLite 形态源;
+# MySQL 侧由 schema runner 翻译执行)。与 _ensure_props_table 保持一致。
+_PROPS_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS props (
+    name TEXT PRIMARY KEY,
+    aliases_json TEXT DEFAULT '[]',
+    prop_type TEXT DEFAULT 'object',
+    visual_prompt TEXT DEFAULT '',
+    description TEXT DEFAULT '',
+    owner TEXT DEFAULT '',
+    notes TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+)
+"""
 
 
 def _safe_text(value: Any) -> str:
@@ -71,21 +88,7 @@ def _load_payload() -> dict[str, Any]:
 
 
 def _ensure_props_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS props (
-            name TEXT PRIMARY KEY,
-            aliases_json TEXT DEFAULT '[]',
-            prop_type TEXT DEFAULT 'object',
-            visual_prompt TEXT DEFAULT '',
-            description TEXT DEFAULT '',
-            owner TEXT DEFAULT '',
-            notes TEXT DEFAULT '',
-            created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now'))
-        )
-        """
-    )
+    conn.execute(_PROPS_DDL_SQL)
 
 
 def _is_global_prop(prop: dict[str, Any]) -> bool:
@@ -134,10 +137,10 @@ def _merge_beat_detected_props(
         conn.execute(
             """
             UPDATE beats
-            SET detected_props_json = ?, updated_at = datetime('now')
+            SET detected_props_json = ?, updated_at = ?
             WHERE episode_number = ? AND beat_number = ?
             """,
-            (json.dumps(detected_props, ensure_ascii=False), episode, beat),
+            (json.dumps(detected_props, ensure_ascii=False), utc_datetime_str(), episode, beat),
         )
     return True, added, detected_props
 
@@ -154,7 +157,8 @@ def sync_global_props(
     project = _validate_path_segment(project, "project")
     paths = ProjectPaths(user, project)
     db_path = paths.data_db
-    if not db_path.exists():
+    mysql_backend = active_backend() == BACKEND_MYSQL
+    if not mysql_backend and not db_path.exists():
         return {"ok": False, "error": f"data.db not found: {db_path}"}
 
     global_props = [prop for prop in props if isinstance(prop, dict) and _is_global_prop(prop)]
@@ -165,16 +169,37 @@ def sync_global_props(
     beat_synced = False
     beat_added_prop_ids: list[str] = []
     beat_detected_props: list[Any] = []
-    ensure_sqlite_schema(
-        db_path,
-        component=_SCHEMA_COMPONENT,
-        version=_SCHEMA_VERSION,
-        initialize=_ensure_props_table,
-    )
-    conn = sqlite3.connect(str(db_path), timeout=10)
+    if mysql_backend:
+        # 与项目 data.db 同一逻辑库。本函数还要读写项目 store 拥有的
+        # episodes/beats 表:先确保项目库 schema(幂等、进程内缓存),
+        # 同时把这些表名登记进 DML 前缀改写器;props 表归属本组件。
+        from novelvideo.db.adapter import acquire_sync
+        from novelvideo.db.dsn import scope_identity
+        from novelvideo.db.schema_runner import ensure_mysql_schema
+        from novelvideo.sqlite_store import ensure_project_store_mysql
+
+        ensure_project_store_mysql(db_path)
+        key, relpath = scope_identity(db_path)
+        ensure_mysql_schema(
+            key,
+            component=_SCHEMA_COMPONENT,
+            version=_SCHEMA_VERSION,
+            ddl_scripts=[_PROPS_DDL_SQL],
+            relpath=relpath,
+        )
+        conn = acquire_sync(key)
+    else:
+        ensure_sqlite_schema(
+            db_path,
+            component=_SCHEMA_COMPONENT,
+            version=_SCHEMA_VERSION,
+            initialize=_ensure_props_table,
+        )
+        conn = sqlite3.connect(str(db_path), timeout=10)
     try:
-        conn.row_factory = sqlite3.Row
-        configure_sqlite_connection(conn, set_journal_mode=False)
+        if not mysql_backend:
+            conn.row_factory = sqlite3.Row
+            configure_sqlite_connection(conn, set_journal_mode=False)
         row = conn.execute(
             "SELECT prop_menu_json FROM episodes WHERE number = ?",
             (episode,),
@@ -211,21 +236,15 @@ def sync_global_props(
 
             aliases = [name] if name and name != prop_id else []
             conn.execute(
-                """
-                INSERT INTO props (
-                    name, aliases_json, prop_type, visual_prompt, description,
-                    owner, notes
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    aliases_json=excluded.aliases_json,
-                    prop_type=excluded.prop_type,
-                    visual_prompt=excluded.visual_prompt,
-                    description=excluded.description,
-                    owner=excluded.owner,
-                    notes=excluded.notes,
-                    updated_at=datetime('now')
-                """,
+                upsert_sql(
+                    "props",
+                    ("name",),
+                    (
+                        "name", "aliases_json", "prop_type", "visual_prompt",
+                        "description", "owner", "notes",
+                    ),
+                    touch_cols=("updated_at",),
+                ),
                 (
                     prop_id,
                     json.dumps(aliases, ensure_ascii=False),
@@ -241,6 +260,7 @@ def sync_global_props(
                         },
                         ensure_ascii=False,
                     ),
+                    utc_datetime_str(),
                 ),
             )
             synced_ids.append(prop_id)
@@ -255,10 +275,10 @@ def sync_global_props(
         conn.execute(
             """
             UPDATE episodes
-            SET prop_menu_json = ?, updated_at = datetime('now')
+            SET prop_menu_json = ?, updated_at = ?
             WHERE number = ?
             """,
-            (json.dumps(prop_menu, ensure_ascii=False), episode),
+            (json.dumps(prop_menu, ensure_ascii=False), utc_datetime_str(), episode),
         )
         conn.commit()
     finally:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,8 +11,50 @@ from pathlib import Path
 import aiosqlite
 from ulid import ULID
 
+from novelvideo.db.adapter import acquire_async
+from novelvideo.db.dsn import scope_identity
+from novelvideo.db.schema_runner import ensure_mysql_schema
+from novelvideo.db.sql_compat import (
+    BACKEND_MYSQL,
+    active_backend,
+    immediate_tx,
+    insert_ignore_sql,
+    is_duplicate_key_error,
+)
 from novelvideo.ports.project import Principal, ProjectRecord
 from novelvideo.shared.project_dirs import default_project_dirs
+
+PROJECT_REGISTRY_SCHEMA_COMPONENT = "project_registry"
+PROJECT_REGISTRY_SCHEMA_VERSION = 1
+
+PROJECT_REGISTRY_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    owner_type TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    owner_username TEXT NOT NULL,
+    name TEXT NOT NULL,
+    home_node_id TEXT NOT NULL,
+    output_dir TEXT NOT NULL,
+    state_dir TEXT NOT NULL,
+    runtime_dir TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    purged_at TEXT,
+    UNIQUE(owner_type, owner_id, name)
+);
+CREATE INDEX IF NOT EXISTS projects_owner_updated_idx
+    ON projects(owner_type, owner_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS projects_status_updated_idx
+    ON projects(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS projects_home_node_idx
+    ON projects(home_node_id);
+"""
 
 
 def _now_iso() -> str:
@@ -70,7 +111,25 @@ class SQLiteProjectRegistry:
 
         return Path(config.STATE_DIR) / "local" / "projects.db"
 
-    async def _connect(self) -> aiosqlite.Connection:
+    async def _connect(self):
+        """Open the registry on the active storage backend.
+
+        MySQL: projects.db is a node-global scope (fixed ``g_projects__``
+        prefix); the schema is ensured process-cached and a pooled connection
+        is returned. No per-connection initialization is needed.
+        """
+
+        if active_backend() == BACKEND_MYSQL:
+            key, relpath = scope_identity(self._db_path())
+            await asyncio.to_thread(
+                ensure_mysql_schema,
+                key,
+                component=PROJECT_REGISTRY_SCHEMA_COMPONENT,
+                version=PROJECT_REGISTRY_SCHEMA_VERSION,
+                ddl_scripts=[PROJECT_REGISTRY_SCHEMA_SQL],
+                relpath=relpath,
+            )
+            return await acquire_async(key)
         await self._ensure_schema()
         db = await aiosqlite.connect(self._db_path())
         db.row_factory = aiosqlite.Row
@@ -86,44 +145,10 @@ class SQLiteProjectRegistry:
             path.parent.mkdir(parents=True, exist_ok=True)
             db = await aiosqlite.connect(path)
             try:
-                await db.executescript(
-                    """
-                    CREATE TABLE IF NOT EXISTS schema_migrations (
-                        version INTEGER PRIMARY KEY,
-                        applied_at TEXT NOT NULL
-                    );
-
-                    CREATE TABLE IF NOT EXISTS projects (
-                        id TEXT PRIMARY KEY,
-                        owner_type TEXT NOT NULL,
-                        owner_id TEXT NOT NULL,
-                        owner_username TEXT NOT NULL,
-                        name TEXT NOT NULL,
-                        home_node_id TEXT NOT NULL,
-                        output_dir TEXT NOT NULL,
-                        state_dir TEXT NOT NULL,
-                        runtime_dir TEXT NOT NULL,
-                        status TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        purged_at TEXT,
-                        UNIQUE(owner_type, owner_id, name)
-                    );
-
-                    CREATE INDEX IF NOT EXISTS projects_owner_updated_idx
-                        ON projects(owner_type, owner_id, updated_at DESC);
-                    CREATE INDEX IF NOT EXISTS projects_status_updated_idx
-                        ON projects(status, updated_at DESC);
-                    CREATE INDEX IF NOT EXISTS projects_home_node_idx
-                        ON projects(home_node_id);
-                    """
-                )
+                await db.executescript(PROJECT_REGISTRY_SCHEMA_SQL)
                 await db.execute(
-                    """
-                    INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-                    VALUES (1, ?)
-                    """,
-                    (_now_iso(),),
+                    insert_ignore_sql("schema_migrations", ("version", "applied_at")),
+                    (1, _now_iso()),
                 )
                 await db.commit()
             finally:
@@ -182,38 +207,38 @@ class SQLiteProjectRegistry:
         db = await self._connect()
         try:
             try:
-                await db.execute("BEGIN IMMEDIATE")
-                await db.execute(
-                    """
-                    INSERT INTO projects (
-                        id, owner_type, owner_id, owner_username, name, home_node_id,
-                        output_dir, state_dir, runtime_dir, status, created_at, updated_at
+                async with immediate_tx(db, lock="projects:create"):
+                    await db.execute(
+                        """
+                        INSERT INTO projects (
+                            id, owner_type, owner_id, owner_username, name, home_node_id,
+                            output_dir, state_dir, runtime_dir, status, created_at, updated_at
+                        )
+                        VALUES (?, 'user', 'local', ?, ?, 'local', ?, ?, ?, 'active', ?, ?)
+                        """,
+                        (
+                            project_id,
+                            owner_username,
+                            name,
+                            output_dir or default_output,
+                            state_dir or default_state,
+                            runtime_dir or default_runtime,
+                            now,
+                            now,
+                        ),
                     )
-                    VALUES (?, 'user', 'local', ?, ?, 'local', ?, ?, ?, 'active', ?, ?)
-                    """,
-                    (
-                        project_id,
-                        owner_username,
-                        name,
-                        output_dir or default_output,
-                        state_dir or default_state,
-                        runtime_dir or default_runtime,
-                        now,
-                        now,
-                    ),
-                )
-                row = await _fetchone(
-                    db,
-                    "SELECT * FROM projects WHERE id = ?",
-                    (project_id,),
-                )
-                await db.commit()
-            except sqlite3.IntegrityError as exc:
-                await db.rollback()
+                    row = await _fetchone(
+                        db,
+                        "SELECT * FROM projects WHERE id = ?",
+                        (project_id,),
+                    )
+            except Exception as exc:
+                # sqlite3.IntegrityError on SQLite; MySQL raises its own
+                # IntegrityError family (1062) through the shim — classify
+                # with the backend-aware predicate.
+                if not is_duplicate_key_error(exc):
+                    raise
                 raise ValueError(f"Project '{name}' already exists") from exc
-            except Exception:
-                await db.rollback()
-                raise
         finally:
             await db.close()
         return _row_to_record(row)

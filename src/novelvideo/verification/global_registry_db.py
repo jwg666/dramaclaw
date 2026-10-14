@@ -15,11 +15,18 @@ that migration path separately.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
+from novelvideo.db.sql_compat import (
+    BACKEND_MYSQL,
+    active_backend,
+    upsert_sql,
+    utc_datetime_str,
+)
 from novelvideo.sqlite_pragmas import configure_sqlite_connection_async
 
 
@@ -40,15 +47,45 @@ CREATE INDEX IF NOT EXISTS idx_defs_layer ON sketch_failure_mode_defs(layer);
 CREATE INDEX IF NOT EXISTS idx_defs_gate_enabled ON sketch_failure_mode_defs(gate_enabled);
 """
 
+_DEFS_SCHEMA_COMPONENT = "verification_defs"
+# MIGRATION CONTRACT: increment this whenever DEFS_SCHEMA_SQL changes.
+_DEFS_SCHEMA_VERSION = 1
 
-async def open_defs_db(db_path: Path) -> aiosqlite.Connection:
+
+def ensure_defs_schema_mysql(db_path: Path) -> None:
+    """MySQL 后端:在 verification.db 逻辑库(g_verification__ 作用域)上
+    确保失败模式定义表 schema(阻塞,建议在 to_thread 中调用)。"""
+
+    from novelvideo.db.dsn import scope_identity
+    from novelvideo.db.schema_runner import ensure_mysql_schema
+
+    key, relpath = scope_identity(db_path)
+    ensure_mysql_schema(
+        key,
+        component=_DEFS_SCHEMA_COMPONENT,
+        version=_DEFS_SCHEMA_VERSION,
+        ddl_scripts=[DEFS_SCHEMA_SQL],
+        relpath=relpath,
+    )
+
+
+async def open_defs_db(db_path: Path):
     """Open (or create) the shared verification DB.
 
     Ensures the parent directory exists and the schema is present.
     Callers are responsible for closing the connection.
+    Returns an aiosqlite connection on SQLite, an adapter async
+    connection (same execute/commit/close surface) on MySQL.
     """
     db_path = Path(db_path).expanduser()
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    if active_backend() == BACKEND_MYSQL:
+        from novelvideo.db.adapter import acquire_async
+        from novelvideo.db.dsn import scope_identity
+
+        await asyncio.to_thread(ensure_defs_schema_mysql, db_path)
+        key, _relpath = scope_identity(db_path)
+        return await acquire_async(key)
     db = await aiosqlite.connect(str(db_path))
     db.row_factory = aiosqlite.Row
     await configure_sqlite_connection_async(db)
@@ -71,23 +108,24 @@ async def ensure_defs_seeded(
     """
     for entry in seeds:
         await db.execute(
-            """
-            INSERT INTO sketch_failure_mode_defs (
-                code, layer, detection, prevention_rule,
-                correction_template, negative_prompt_clause,
-                gate_enabled, fixture_path,
-                created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, '', datetime('now'), datetime('now'))
-            ON CONFLICT(code) DO UPDATE SET
-                layer = excluded.layer,
-                detection = excluded.detection,
-                prevention_rule = excluded.prevention_rule,
-                correction_template = excluded.correction_template,
-                negative_prompt_clause = excluded.negative_prompt_clause,
-                gate_enabled = excluded.gate_enabled,
-                updated_at = datetime('now')
-            """,
+            upsert_sql(
+                "sketch_failure_mode_defs",
+                ("code",),
+                (
+                    "code", "layer", "detection", "prevention_rule",
+                    "correction_template", "negative_prompt_clause",
+                    "gate_enabled", "fixture_path", "created_at", "updated_at",
+                ),
+                set_sql=(
+                    "layer = excluded.layer, "
+                    "detection = excluded.detection, "
+                    "prevention_rule = excluded.prevention_rule, "
+                    "correction_template = excluded.correction_template, "
+                    "negative_prompt_clause = excluded.negative_prompt_clause, "
+                    "gate_enabled = excluded.gate_enabled"
+                ),
+                touch_cols=("updated_at",),
+            ),
             (
                 entry["code"],
                 entry["layer"],
@@ -96,6 +134,10 @@ async def ensure_defs_seeded(
                 entry.get("correction_template", ""),
                 entry.get("negative_prompt_clause", ""),
                 int(entry.get("gate_enabled", 0)),
+                "",
+                utc_datetime_str(),
+                utc_datetime_str(),
+                utc_datetime_str(),
             ),
         )
     await db.commit()

@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,11 +18,53 @@ from typing import Any, Iterable
 from novelvideo.chat import service as chat_service
 from novelvideo.chat.live_events import broadcast_project_chat_event
 from novelvideo.project_context import ProjectContext, resolve_project_context
+from novelvideo.db.adapter import acquire_sync
+from novelvideo.db.dsn import scope_identity
+from novelvideo.db.schema_runner import ensure_mysql_schema
+from novelvideo.db.sql_compat import (
+    BACKEND_MYSQL,
+    active_backend,
+    table_columns_sync,
+    upsert_sql,
+)
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
 from novelvideo.task_state import TaskState, get_task_manager
 
 
 logger = logging.getLogger(__name__)
+
+DIRECTOR_AUTO_SCHEMA_COMPONENT = "director_auto"
+DIRECTOR_AUTO_SCHEMA_VERSION = 1
+
+DIRECTOR_AUTO_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS director_auto_runs (
+  run_id TEXT PRIMARY KEY,
+  username TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  episode INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  activated_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  context_json TEXT NOT NULL,
+  baseline_task_ids_json TEXT NOT NULL,
+  handled_task_ids_json TEXT NOT NULL,
+  recovery_keys_json TEXT NOT NULL DEFAULT '[]',
+  voice_policy TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  owner_token TEXT NOT NULL DEFAULT '',
+  lease_expires_at REAL NOT NULL DEFAULT 0,
+  UNIQUE(username, project_id)
+)
+"""
+
+# (table, column, SQLite definition) — the ad-hoc ALTER upgrades applied to
+# pre-lease legacy director_auto databases.
+DIRECTOR_AUTO_COLUMN_UPGRADES = (
+    ("director_auto_runs", "recovery_keys_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("director_auto_runs", "voice_policy", "TEXT NOT NULL DEFAULT ''"),
+    ("director_auto_runs", "owner_token", "TEXT NOT NULL DEFAULT ''"),
+    ("director_auto_runs", "lease_expires_at", "REAL NOT NULL DEFAULT 0"),
+)
 
 AUTO_TASK_TYPES = frozenset({
     "ingest_fast",
@@ -128,37 +171,40 @@ class DirectorAutoStore:
     def __init__(self, db_path: Path | None = None) -> None:
         self.db_path = db_path or (_state_root() / "director_auto.db")
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
+        """Open the coordinator DB on the active storage backend.
+
+        Mirrors sqlite3's ``with conn`` protocol (commit on success, rollback
+        on error) so the existing ``with self._connect() as conn`` call sites
+        stay unchanged. MySQL: schema ensured process-cached, pooled
+        thread-local connection (close is a no-op release).
+        """
+
+        if active_backend() == BACKEND_MYSQL:
+            key, relpath = scope_identity(self.db_path)
+            ensure_mysql_schema(
+                key,
+                component=DIRECTOR_AUTO_SCHEMA_COMPONENT,
+                version=DIRECTOR_AUTO_SCHEMA_VERSION,
+                ddl_scripts=[DIRECTOR_AUTO_SCHEMA_SQL],
+                column_upgrades=DIRECTOR_AUTO_COLUMN_UPGRADES,
+                relpath=relpath,
+            )
+            conn = acquire_sync(key)
+            try:
+                yield conn
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         configure_sqlite_connection(conn)
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS director_auto_runs (
-              run_id TEXT PRIMARY KEY,
-              username TEXT NOT NULL,
-              project_id TEXT NOT NULL,
-              episode INTEGER NOT NULL,
-              status TEXT NOT NULL,
-              activated_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              context_json TEXT NOT NULL,
-              baseline_task_ids_json TEXT NOT NULL,
-              handled_task_ids_json TEXT NOT NULL,
-              recovery_keys_json TEXT NOT NULL DEFAULT '[]',
-              voice_policy TEXT NOT NULL DEFAULT '',
-              last_error TEXT NOT NULL DEFAULT '',
-              owner_token TEXT NOT NULL DEFAULT '',
-              lease_expires_at REAL NOT NULL DEFAULT 0,
-              UNIQUE(username, project_id)
-            )
-            """
-        )
-        columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(director_auto_runs)").fetchall()
-        }
+        conn.execute(DIRECTOR_AUTO_SCHEMA_SQL)
+        columns = set(table_columns_sync(conn, "director_auto_runs"))
         if "recovery_keys_json" not in columns:
             conn.execute(
                 "ALTER TABLE director_auto_runs "
@@ -180,7 +226,15 @@ class DirectorAutoStore:
                 "ADD COLUMN lease_expires_at REAL NOT NULL DEFAULT 0"
             )
         conn.commit()
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        # 与原实现一致:sqlite3 的 ``with conn`` 只提交不关闭,连接交由 GC
+        # 回收。显式 close 会在每次调用上触发 WAL checkpoint(fsync),在
+        # Windows 上把单次操作拖慢到 ~100ms,破坏轮询循环的时序假设。
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> DirectorAutoRun | None:
@@ -203,35 +257,52 @@ class DirectorAutoStore:
         )
 
     def upsert(self, run: DirectorAutoRun) -> None:
+        cols = (
+            "run_id",
+            "username",
+            "project_id",
+            "episode",
+            "status",
+            "activated_at",
+            "updated_at",
+            "context_json",
+            "baseline_task_ids_json",
+            "handled_task_ids_json",
+            "recovery_keys_json",
+            "voice_policy",
+            "last_error",
+        )
+        # Raw SET clause: the two CASE guards must read the *existing* row
+        # (director_auto_runs.*) against the *conflicting* row (excluded.*).
+        set_sql = ", ".join(
+            (
+                "run_id=excluded.run_id",
+                "episode=excluded.episode",
+                "status=excluded.status",
+                "activated_at=excluded.activated_at",
+                "updated_at=excluded.updated_at",
+                "context_json=excluded.context_json",
+                "baseline_task_ids_json=excluded.baseline_task_ids_json",
+                "handled_task_ids_json=excluded.handled_task_ids_json",
+                "recovery_keys_json=excluded.recovery_keys_json",
+                "voice_policy=excluded.voice_policy",
+                "last_error=excluded.last_error",
+                "owner_token=CASE"
+                " WHEN director_auto_runs.run_id != excluded.run_id THEN ''"
+                " ELSE director_auto_runs.owner_token END",
+                "lease_expires_at=CASE"
+                " WHEN director_auto_runs.run_id != excluded.run_id THEN 0"
+                " ELSE director_auto_runs.lease_expires_at END",
+            )
+        )
         with self._connect() as conn:
             conn.execute(
-                """
-                INSERT INTO director_auto_runs(
-                  run_id, username, project_id, episode, status, activated_at,
-                  updated_at, context_json, baseline_task_ids_json,
-                  handled_task_ids_json, recovery_keys_json, voice_policy, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(username, project_id) DO UPDATE SET
-                  run_id=excluded.run_id,
-                  episode=excluded.episode,
-                  status=excluded.status,
-                  activated_at=excluded.activated_at,
-                  updated_at=excluded.updated_at,
-                  context_json=excluded.context_json,
-                  baseline_task_ids_json=excluded.baseline_task_ids_json,
-                  handled_task_ids_json=excluded.handled_task_ids_json,
-                  recovery_keys_json=excluded.recovery_keys_json,
-                  voice_policy=excluded.voice_policy,
-                  last_error=excluded.last_error,
-                  owner_token=CASE
-                    WHEN director_auto_runs.run_id != excluded.run_id THEN ''
-                    ELSE director_auto_runs.owner_token
-                  END,
-                  lease_expires_at=CASE
-                    WHEN director_auto_runs.run_id != excluded.run_id THEN 0
-                    ELSE director_auto_runs.lease_expires_at
-                  END
-                """,
+                upsert_sql(
+                    "director_auto_runs",
+                    ("username", "project_id"),
+                    cols,
+                    set_sql=set_sql,
+                ),
                 (
                     run.run_id,
                     run.username,

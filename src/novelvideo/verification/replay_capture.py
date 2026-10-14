@@ -463,7 +463,10 @@ async def find_traces_for_run(
     if resolved is None:
         return {}
     training_db_path, _artifacts, _user, _project = resolved
-    if not training_db_path.exists():
+    from novelvideo.db.sql_compat import is_mysql
+
+    # MySQL 后端没有物理库文件:training_db_path 只是作用域身份,跳过存在性检查
+    if not is_mysql() and not training_db_path.exists():
         return {}
     db = await training_db.open_training_db(training_db_path)
     try:

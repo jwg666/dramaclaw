@@ -9,6 +9,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from novelvideo.db.sql_compat import is_mysql
+
 ProgressCallback = Callable[[float, str], None]
 LogCallback = Callable[[str], None]
 SELECT_RESULT_JSONL_NAME = "select_result.jsonl"
@@ -74,8 +76,19 @@ def _load_sqlite_script_payload(project_dir: Path, episode_num: int) -> dict[str
         db_path = _project_sqlite_path(project_dir)
     except FileNotFoundError:
         return None
-    if not db_path.exists():
+    if is_mysql():
+        fetched = _fetch_beat_source_rows_mysql(db_path, episode_num)
+    else:
+        if not db_path.exists():
+            return None
+        fetched = _fetch_beat_source_rows_sqlite(db_path, episode_num)
+    if fetched is None:
         return None
+    beat_rows, episode_row = fetched
+    return _build_script_payload(episode_num, beat_rows, episode_row)
+
+
+def _fetch_beat_source_rows_sqlite(db_path: Path, episode_num: int):
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
@@ -98,7 +111,44 @@ def _load_sqlite_script_payload(project_dir: Path, episode_num: int) -> dict[str
             conn.close()
     except sqlite3.DatabaseError:
         return None
+    return beat_rows, episode_row
 
+
+def _fetch_beat_source_rows_mysql(db_path: Path, episode_num: int):
+    """MySQL 后端:项目 data.db 逻辑库上的只读取数(表缺失等价于文件缺失)。"""
+
+    from novelvideo.db.adapter import acquire_sync
+    from novelvideo.db.dsn import scope_identity
+
+    key, _relpath = scope_identity(db_path)
+    conn = acquire_sync(key)
+    try:
+        beat_rows = conn.execute(
+            """
+            SELECT * FROM beats
+            WHERE episode_number = ?
+            ORDER BY COALESCE(shot_order, beat_number * 10), beat_number
+            """,
+            (episode_num,),
+        ).fetchall()
+        if not beat_rows:
+            return None
+        episode_row = conn.execute(
+            "SELECT * FROM episodes WHERE number = ?",
+            (episode_num,),
+        ).fetchone()
+    except Exception:
+        return None
+    finally:
+        conn.close()
+    return beat_rows, episode_row
+
+
+def _build_script_payload(
+    episode_num: int,
+    beat_rows,
+    episode_row,
+) -> dict[str, Any]:
     beats: list[dict[str, Any]] = []
     for row in beat_rows:
         scene_ref: dict[str, Any] | None = None

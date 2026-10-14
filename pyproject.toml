@@ -63,6 +63,7 @@ dependencies = [
     "langid>=1.1.6,<2.0.0",
     "wordninja>=2.0.0,<3.0.0",
     "markdown-it-py>=4.0.0,<5.0.0",
+    "aiomysql",
 ]
 
 [project.scripts]
@@ -187,6 +188,7 @@ markers = [
     "m08: OSS split module M08",
     "m09: OSS split module M09",
     "m10: OSS split module M10",
+    "mysql: tests that require NOVELVIDEO_DB_DSN pointing at a live MySQL 8",
 ]
 
 [[tool.uv.dependency-metadata]]

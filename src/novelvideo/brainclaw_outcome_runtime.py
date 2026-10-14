@@ -22,8 +22,41 @@ import time
 import urllib.error
 import urllib.request
 
+from novelvideo.db.sql_compat import (
+    BACKEND_MYSQL,
+    active_backend,
+    insert_ignore_sql,
+    rowid_expr,
+)
+
 
 RECEIPT_HEADER = "x-brainclaw-outcome-receipt"
+
+_OUTCOME_SCHEMA_COMPONENT = "brainclaw_outcomes"
+# MIGRATION CONTRACT: increment this whenever either DDL below changes.
+_OUTCOME_SCHEMA_VERSION = 1
+
+# SQLite 形态(identity 即主键,隐式 rowid 支持插入序)
+_OUTCOMES_DDL_SQLITE = (
+    "CREATE TABLE IF NOT EXISTS outcomes ("
+    "identity TEXT PRIMARY KEY, "
+    "body TEXT NOT NULL, "
+    "attempts INTEGER NOT NULL DEFAULT 0, "
+    "next_attempt REAL NOT NULL DEFAULT 0)"
+)
+
+# MySQL 形态:显式自增 id(供 rowid_expr("outcomes") 使用),
+# identity 走唯一键保持 INSERT IGNORE / DELETE BY identity 语义。
+_OUTCOMES_DDL_MYSQL = """
+CREATE TABLE IF NOT EXISTS outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity TEXT NOT NULL,
+    body TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt REAL NOT NULL DEFAULT 0,
+    UNIQUE (identity)
+)
+"""
 _receipts: ContextVar[tuple[str, ...]] = ContextVar("brainclaw_outcome_receipts", default=())
 _runtime: "OutcomeRuntime | None" = None
 _runtime_lock = threading.Lock()
@@ -64,14 +97,30 @@ class OutcomeRuntime:
         if not endpoint.startswith("http://127.0.0.1:") and not endpoint.startswith("http://localhost:"):
             raise ValueError("BrainClaw Outcome endpoint must be loopback HTTP")
         self.endpoint = endpoint
-        database.parent.mkdir(parents=True, exist_ok=True)
-        database.parent.chmod(0o700)
-        self.connection = sqlite3.connect(database, check_same_thread=False)
-        database.chmod(0o600)
-        self.connection.execute(
-            "CREATE TABLE IF NOT EXISTS outcomes (identity TEXT PRIMARY KEY, body TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0)"
-        )
-        self.connection.commit()
+        self._mysql_backend = active_backend() == BACKEND_MYSQL
+        if self._mysql_backend:
+            # 独立逻辑库(state/brainclaw/outcomes.sqlite3 对应的作用域);
+            # 连接由 adapter 线程本地缓存,跨线程访问由 self.lock 串行化。
+            from novelvideo.db.adapter import acquire_sync
+            from novelvideo.db.dsn import scope_identity
+            from novelvideo.db.schema_runner import ensure_mysql_schema
+
+            key, relpath = scope_identity(database)
+            ensure_mysql_schema(
+                key,
+                component=_OUTCOME_SCHEMA_COMPONENT,
+                version=_OUTCOME_SCHEMA_VERSION,
+                ddl_scripts=[_OUTCOMES_DDL_MYSQL],
+                relpath=relpath,
+            )
+            self.connection = acquire_sync(key)
+        else:
+            database.parent.mkdir(parents=True, exist_ok=True)
+            database.parent.chmod(0o700)
+            self.connection = sqlite3.connect(database, check_same_thread=False)
+            database.chmod(0o600)
+            self.connection.execute(_OUTCOMES_DDL_SQLITE)
+            self.connection.commit()
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.thread = threading.Thread(target=self._run, name="brainclaw-outcomes", daemon=True)
@@ -91,7 +140,9 @@ class OutcomeRuntime:
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         identity = hashlib.sha256(f"{receipt}\0request\0automatic_contract".encode()).hexdigest()
         with self.lock:
-            self.connection.execute("INSERT OR IGNORE INTO outcomes(identity,body) VALUES(?,?)", (identity, body))
+            self.connection.execute(
+                insert_ignore_sql("outcomes", ("identity", "body")), (identity, body)
+            )
             self.connection.commit()
         self.wake.set()
 
@@ -101,9 +152,11 @@ class OutcomeRuntime:
             self.wake.clear()
             with self.lock:
                 rows = self.connection.execute(
-                    "SELECT identity,body,attempts FROM outcomes WHERE next_attempt<=? ORDER BY rowid LIMIT 100", (time.time(),)
+                    f"SELECT identity,body,attempts FROM outcomes WHERE next_attempt<=? ORDER BY {rowid_expr('outcomes')} LIMIT 100", (time.time(),)
                 ).fetchall()
-            for identity, body, attempts in rows:
+            # 位置取值:sqlite3 返回裸元组,MySQL 适配层的 Row 需按下标解包
+            for row in rows:
+                identity, body, attempts = row[0], row[1], row[2]
                 encoded = body.encode()
                 signature = hmac.new(self.key, encoded, hashlib.sha256).hexdigest()
                 request = urllib.request.Request(

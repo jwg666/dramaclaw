@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from novelvideo.db.sql_compat import immediate_tx_sync
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
 
 BRIDGE_RESULT_TTL_SECONDS = 24 * 60 * 60
@@ -177,8 +178,9 @@ def _prune_bridge_rows(
 
 def bridge_status_counts(*, bridge_dir: str | Path | None = None) -> dict[str, int]:
     """Return observable queue depth by durable transport status."""
-    with _bridge_db(bridge_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _bridge_db(bridge_dir) as conn, immediate_tx_sync(
+        conn, lock="canvas_command_messages:status_counts"
+    ):
         _prune_bridge_rows(conn, now=time.time(), bridge_dir=bridge_dir)
         rows = conn.execute(
             "SELECT status, COUNT(*) AS count FROM canvas_command_messages GROUP BY status"
@@ -226,8 +228,10 @@ def find_clarification_bridge_message(
     if not wanted:
         return None
     now = time.time()
-    with _bridge_db(bridge_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _bridge_db(bridge_dir) as conn, immediate_tx_sync(
+        conn,
+        lock=f"canvas_command_messages:clarification:{project_id or ''}:{canvas_id or ''}",
+    ):
         _prune_bridge_rows(conn, now=now, bridge_dir=bridge_dir)
         rows = conn.execute(
             "SELECT * FROM canvas_command_messages "
@@ -291,8 +295,9 @@ def list_pending_bridge_messages(
         where += " AND created_at >= ?"
         parameters.append(float(created_after))
     parameters.append(max(1, min(int(limit), 500)))
-    with _bridge_db(bridge_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _bridge_db(bridge_dir) as conn, immediate_tx_sync(
+        conn, lock=f"canvas_command_messages:pending:{project_id}:{canvas_id}"
+    ):
         _prune_bridge_rows(conn, now=now, bridge_dir=bridge_dir)
         rows = conn.execute(
             f"SELECT * FROM canvas_command_messages WHERE {where} "
@@ -323,8 +328,9 @@ def mark_bridge_message_delivered(
     bridge_dir: str | Path | None = None,
 ) -> bool:
     now = time.time()
-    with _bridge_db(bridge_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _bridge_db(bridge_dir) as conn, immediate_tx_sync(
+        conn, lock=f"canvas_command_messages:{key}"
+    ):
         cursor = conn.execute(
             """
             UPDATE canvas_command_messages
@@ -493,8 +499,9 @@ def _put_pending_bridge_message(
     bridge_dir: str | Path | None = None,
 ) -> dict[str, Any] | None:
     now = time.time()
-    with _bridge_db(bridge_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _bridge_db(bridge_dir) as conn, immediate_tx_sync(
+        conn, lock=f"canvas_command_messages:{key}"
+    ):
         _prune_bridge_rows(conn, now=now, bridge_dir=bridge_dir)
         existing = conn.execute(
             "SELECT * FROM canvas_command_messages WHERE bridge_key = ?",
@@ -569,8 +576,9 @@ def _put_pending_bridge_message(
 def _read_durable_bridge_result(
     key: str, *, bridge_dir: str | Path | None = None
 ) -> dict[str, Any] | None:
-    with _bridge_db(bridge_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _bridge_db(bridge_dir) as conn, immediate_tx_sync(
+        conn, lock=f"canvas_command_messages:{key}"
+    ):
         _prune_bridge_rows(conn, now=time.time(), bridge_dir=bridge_dir)
         row = conn.execute(
             "SELECT status, result_json FROM canvas_command_messages WHERE bridge_key = ?",
@@ -588,8 +596,9 @@ def _resolve_durable_bridge_message(
     bridge_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     now = time.time()
-    with _bridge_db(bridge_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _bridge_db(bridge_dir) as conn, immediate_tx_sync(
+        conn, lock=f"canvas_command_messages:{key}"
+    ):
         existing = conn.execute(
             "SELECT * FROM canvas_command_messages WHERE bridge_key = ?",
             (key,),

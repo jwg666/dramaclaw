@@ -39,6 +39,7 @@ from typing import Any
 
 import aiosqlite
 
+from novelvideo.db.sql_compat import upsert_sql, utc_datetime_str
 from novelvideo.verification.global_registry_db import (
     ensure_defs_seeded,
     open_defs_db,
@@ -387,9 +388,9 @@ async def upsert(
         set_clause = ", ".join(f"{col} = ?" for col in columns)
         params = [fields[col] for col in columns]
         await defs_db.execute(
-            f"UPDATE sketch_failure_mode_defs SET {set_clause}, updated_at = datetime('now') "
+            f"UPDATE sketch_failure_mode_defs SET {set_clause}, updated_at = ? "
             "WHERE code = ?",
-            (*params, code),
+            (*params, utc_datetime_str(), code),
         )
     await defs_db.commit()
 
@@ -417,18 +418,22 @@ def seed_codes() -> list[str]:
 async def bump_hit(project_db: aiosqlite.Connection, code: str, episode: int) -> None:
     """Increment a project-local hit counter on `sketch_failure_mode_hits`."""
     await project_db.execute(
-        """
-        INSERT INTO sketch_failure_mode_hits (code, first_seen_episode, hit_count, last_seen_at)
-        VALUES (?, ?, 1, datetime('now'))
-        ON CONFLICT(code) DO UPDATE SET
-            hit_count = hit_count + 1,
-            first_seen_episode = CASE
-                WHEN first_seen_episode = -1 THEN excluded.first_seen_episode
-                ELSE first_seen_episode
-            END,
-            last_seen_at = datetime('now')
-        """,
-        (code, int(episode)),
+        upsert_sql(
+            "sketch_failure_mode_hits",
+            ("code",),
+            ("code", "first_seen_episode", "hit_count", "last_seen_at"),
+            # 自引用一律带表名限定:MySQL 的 `AS new` 行别名下,裸列名会
+            # 报 1052 ambiguous(SQLite 侧等价合法)
+            set_sql=(
+                "hit_count = sketch_failure_mode_hits.hit_count + 1, "
+                "first_seen_episode = CASE "
+                "WHEN sketch_failure_mode_hits.first_seen_episode = -1 "
+                "THEN excluded.first_seen_episode "
+                "ELSE sketch_failure_mode_hits.first_seen_episode END"
+            ),
+            touch_cols=("last_seen_at",),
+        ),
+        (code, int(episode), 1, utc_datetime_str(), utc_datetime_str()),
     )
     await project_db.commit()
 
@@ -553,36 +558,52 @@ def load_negative_clause_for_project_sync(project_dir: str | None, layer: str) -
     if not db_path:
         return ""
     try:
-        import sqlite3
+        from novelvideo.db.sql_compat import BACKEND_MYSQL, active_backend
+        from novelvideo.verification.global_registry_db import (
+            DEFS_SCHEMA_SQL,
+            ensure_defs_schema_mysql,
+        )
 
-        from novelvideo.sqlite_pragmas import configure_sqlite_connection
-        from novelvideo.verification.global_registry_db import DEFS_SCHEMA_SQL
+        if active_backend() == BACKEND_MYSQL:
+            from novelvideo.db.adapter import acquire_sync
+            from novelvideo.db.dsn import scope_identity
 
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
-        configure_sqlite_connection(conn)
+            ensure_defs_schema_mysql(db_path)
+            key, _relpath = scope_identity(db_path)
+            conn = acquire_sync(key)
+        else:
+            import sqlite3
+
+            from novelvideo.sqlite_pragmas import configure_sqlite_connection
+
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            configure_sqlite_connection(conn)
         try:
-            conn.executescript(DEFS_SCHEMA_SQL)
+            if active_backend() != BACKEND_MYSQL:
+                conn.executescript(DEFS_SCHEMA_SQL)
+            seed_upsert_sql = upsert_sql(
+                "sketch_failure_mode_defs",
+                ("code",),
+                (
+                    "code", "layer", "detection", "prevention_rule",
+                    "correction_template", "negative_prompt_clause",
+                    "gate_enabled", "fixture_path", "created_at", "updated_at",
+                ),
+                set_sql=(
+                    "layer = excluded.layer, "
+                    "detection = excluded.detection, "
+                    "prevention_rule = excluded.prevention_rule, "
+                    "correction_template = excluded.correction_template, "
+                    "negative_prompt_clause = excluded.negative_prompt_clause, "
+                    "gate_enabled = excluded.gate_enabled"
+                ),
+                touch_cols=("updated_at",),
+            )
             for entry in _SEED_FAILURE_MODES:
                 conn.execute(
-                    """
-                    INSERT INTO sketch_failure_mode_defs (
-                        code, layer, detection, prevention_rule,
-                        correction_template, negative_prompt_clause,
-                        gate_enabled, fixture_path,
-                        created_at, updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, '', datetime('now'), datetime('now'))
-                    ON CONFLICT(code) DO UPDATE SET
-                        layer = excluded.layer,
-                        detection = excluded.detection,
-                        prevention_rule = excluded.prevention_rule,
-                        correction_template = excluded.correction_template,
-                        negative_prompt_clause = excluded.negative_prompt_clause,
-                        gate_enabled = excluded.gate_enabled,
-                        updated_at = datetime('now')
-                    """,
+                    seed_upsert_sql,
                     (
                         entry["code"],
                         entry["layer"],
@@ -591,6 +612,10 @@ def load_negative_clause_for_project_sync(project_dir: str | None, layer: str) -
                         entry.get("correction_template", ""),
                         entry.get("negative_prompt_clause", ""),
                         int(entry.get("gate_enabled", 0)),
+                        "",
+                        utc_datetime_str(),
+                        utc_datetime_str(),
+                        utc_datetime_str(),
                     ),
                 )
             conn.commit()

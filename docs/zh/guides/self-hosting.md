@@ -97,6 +97,8 @@ docker run --rm -v dramaclaw-ce_newapi-data:/data -v "$PWD":/backup alpine \
   tar czf /backup/newapi-data.tgz -C /data .
 ```
 
+> 若已配置 `NOVELVIDEO_DB_DSN` 把自研存储切到 MySQL，则 `ce-data` 卷里的关系数据不再增长，备份方式改为对 MySQL 库做 `mysqldump`（`mysql-data` 卷本身仍建议纳入磁盘快照）；网关库（`newapi-data`）仍按上面方式备份。
+
 按同样方式恢复到目标卷：
 
 ```bash

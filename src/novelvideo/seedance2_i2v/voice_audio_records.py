@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from novelvideo.db.sql_compat import is_mysql, table_columns_sync, upsert_sql
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
 from novelvideo.sqlite_schema import ensure_sqlite_schema
 
@@ -37,6 +38,11 @@ _SCHEMA_COMPONENT = "seedance2_voice_audio_records"
 # _ensure_schema_columns changes.
 _SCHEMA_VERSION = 1
 
+# MySQL 侧逐列升级清单(与 _ensure_schema_columns 一致)
+_COLUMN_UPGRADES = (
+    ("seedance2_voice_audio_records", "text_sha256", "TEXT NOT NULL DEFAULT ''"),
+)
+
 
 @dataclass(frozen=True)
 class Seedance2VoiceAudioRecord:
@@ -62,6 +68,29 @@ class Seedance2VoiceAudioState:
 
 @contextmanager
 def _connect(db_path: str | Path):
+    if is_mysql():
+        # db_path 是项目 data.db:同一逻辑库(表名前缀),schema 走迁移台账
+        from novelvideo.db.adapter import acquire_sync
+        from novelvideo.db.dsn import scope_identity
+        from novelvideo.db.schema_runner import ensure_mysql_schema
+
+        key, relpath = scope_identity(db_path)
+        ensure_mysql_schema(
+            key,
+            component=_SCHEMA_COMPONENT,
+            version=_SCHEMA_VERSION,
+            ddl_scripts=[_SCHEMA_SQL],
+            column_upgrades=_COLUMN_UPGRADES,
+            relpath=relpath,
+        )
+        conn = acquire_sync(key)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            # 线程本地缓存连接,close() 归属 adapter,不真正断开
+            conn.close()
+        return
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     ensure_sqlite_schema(
@@ -87,10 +116,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_schema_columns(conn: sqlite3.Connection) -> None:
-    columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(seedance2_voice_audio_records)")
-    }
+    columns = table_columns_sync(conn, "seedance2_voice_audio_records")
     if "text_sha256" not in columns:
         conn.execute(
             "ALTER TABLE seedance2_voice_audio_records "
@@ -143,22 +169,15 @@ def upsert_seedance2_voice_audio_record(
     generated_at = datetime.now(timezone.utc).isoformat()
     with _connect(db_path) as conn:
         conn.execute(
-            """
-            INSERT INTO seedance2_voice_audio_records (
-                episode_number, beat_number, speaker, audio_path, voice_sha256,
-                text_sha256, mode, provider, model, generated_at, status, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(episode_number, beat_number, speaker) DO UPDATE SET
-                audio_path = excluded.audio_path,
-                voice_sha256 = excluded.voice_sha256,
-                text_sha256 = excluded.text_sha256,
-                mode = excluded.mode,
-                provider = excluded.provider,
-                model = excluded.model,
-                generated_at = excluded.generated_at,
-                status = excluded.status,
-                error = excluded.error
-            """,
+            upsert_sql(
+                "seedance2_voice_audio_records",
+                ("episode_number", "beat_number", "speaker"),
+                (
+                    "episode_number", "beat_number", "speaker", "audio_path",
+                    "voice_sha256", "text_sha256", "mode", "provider", "model",
+                    "generated_at", "status", "error",
+                ),
+            ),
             (
                 int(episode_number),
                 int(beat_number),
